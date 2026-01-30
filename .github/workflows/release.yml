@@ -22,6 +22,8 @@ jobs:
         env:
           APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_CERTIFICATE_KEY_BASE64: ${{ secrets.APPLE_CERTIFICATE_KEY_BASE64 }}
+          APPLE_CERTIFICATE_CER_BASE64: ${{ secrets.APPLE_CERTIFICATE_CER_BASE64 }}
         run: |
           # Create temporary keychain
           KEYCHAIN_PATH=$RUNNER_TEMP/signing.keychain-db
@@ -32,18 +34,33 @@ jobs:
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
           # Import certificate
-          CERTIFICATE_PATH=$RUNNER_TEMP/certificate.p12
-          echo "APPLE_CERTIFICATE_BASE64 length: ${#APPLE_CERTIFICATE_BASE64} bytes"
-          echo "APPLE_CERTIFICATE_PASSWORD length: ${#APPLE_CERTIFICATE_PASSWORD} chars"
-          echo "$APPLE_CERTIFICATE_BASE64" | base64 --decode > "$CERTIFICATE_PATH"
-          echo "Decoded certificate size: $(wc -c < "$CERTIFICATE_PATH") bytes"
+          if [[ -n "$APPLE_CERTIFICATE_KEY_BASE64" && -n "$APPLE_CERTIFICATE_CER_BASE64" ]]; then
+            KEY_PATH=$RUNNER_TEMP/certificate.key
+            CER_PATH=$RUNNER_TEMP/certificate.cer
 
-          security import "$CERTIFICATE_PATH" \
-            -P "$APPLE_CERTIFICATE_PASSWORD" \
-            -A \
-            -t cert \
-            -f pkcs12 \
-            -k "$KEYCHAIN_PATH"
+            echo "APPLE_CERTIFICATE_KEY_BASE64 length: ${#APPLE_CERTIFICATE_KEY_BASE64} bytes"
+            echo "APPLE_CERTIFICATE_CER_BASE64 length: ${#APPLE_CERTIFICATE_CER_BASE64} bytes"
+            echo "$APPLE_CERTIFICATE_KEY_BASE64" | base64 --decode > "$KEY_PATH"
+            echo "$APPLE_CERTIFICATE_CER_BASE64" | base64 --decode > "$CER_PATH"
+            echo "Decoded key size: $(wc -c < "$KEY_PATH") bytes"
+            echo "Decoded cert size: $(wc -c < "$CER_PATH") bytes"
+
+            security import "$KEY_PATH" -A -k "$KEYCHAIN_PATH"
+            security import "$CER_PATH" -A -t cert -k "$KEYCHAIN_PATH"
+          else
+            CERTIFICATE_PATH=$RUNNER_TEMP/certificate.p12
+            echo "APPLE_CERTIFICATE_BASE64 length: ${#APPLE_CERTIFICATE_BASE64} bytes"
+            echo "APPLE_CERTIFICATE_PASSWORD length: ${#APPLE_CERTIFICATE_PASSWORD} chars"
+            echo "$APPLE_CERTIFICATE_BASE64" | base64 --decode > "$CERTIFICATE_PATH"
+            echo "Decoded certificate size: $(wc -c < "$CERTIFICATE_PATH") bytes"
+
+            security import "$CERTIFICATE_PATH" \
+              -P "$APPLE_CERTIFICATE_PASSWORD" \
+              -A \
+              -t cert \
+              -f pkcs12 \
+              -k "$KEYCHAIN_PATH"
+          fi
 
           security list-keychain -d user -s "$KEYCHAIN_PATH"
 
