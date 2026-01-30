@@ -131,6 +131,7 @@ jobs:
       - name: Create Release Archive
         run: |
           zip -r MacMCPControl.zip MacMCPControl.app
+          tar -czf MacMCPControl.app.tar.gz MacMCPControl.app
 
       - name: Get Version
         id: version
@@ -143,7 +144,9 @@ jobs:
         with:
           tag_name: v${{ steps.version.outputs.version }}
           name: Mac MCP Control v${{ steps.version.outputs.version }}
-          files: MacMCPControl.zip
+          files: |
+            MacMCPControl.zip
+            MacMCPControl.app.tar.gz
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
