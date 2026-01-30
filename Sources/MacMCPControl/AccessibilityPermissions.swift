@@ -8,12 +8,10 @@ class AccessibilityPermissions {
         let accessEnabled = AXIsProcessTrustedWithOptions(options)
 
         if accessEnabled {
-            print("✓ Accessibility permissions granted")
+            LogStore.shared.log("Accessibility permissions granted.")
         } else {
-            print("⚠️  Accessibility permissions not granted")
-            print("   Please grant accessibility permissions in System Preferences:")
-            print("   System Preferences > Security & Privacy > Privacy > Accessibility")
-            print("   Add 'Mac MCP Control' to the list and enable it")
+            LogStore.shared.log("Accessibility permissions not granted.", level: .warning)
+            LogStore.shared.log("Open System Settings > Privacy & Security > Accessibility and enable \"Mac MCP Control\".", level: .warning)
         }
 
         return accessEnabled

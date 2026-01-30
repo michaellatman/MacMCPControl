@@ -13,7 +13,7 @@ class SettingsManager {
     }
 
     var deviceName: String {
-        get { defaults.string(forKey: Keys.deviceName) ?? "Michael's Mac" }
+        get { defaults.string(forKey: Keys.deviceName) ?? Host.current().localizedName ?? "My Mac" }
         set { defaults.set(newValue, forKey: Keys.deviceName) }
     }
 

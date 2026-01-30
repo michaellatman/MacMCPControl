@@ -9,18 +9,32 @@ struct OAuthCodeRecord {
     let expiresAt: Date
     let codeChallenge: String?
     let codeChallengeMethod: String?
+    let sessionName: String?
 }
 
 struct OAuthTokenRecord {
     let clientId: String
     let scope: String
     let expiresAt: Date
+    var sessionName: String?
+    var lastUsedAt: Date?
+}
+
+struct OAuthRefreshTokenInfo {
+    let token: String
+    let clientId: String
+    let scope: String
+    let expiresAt: Date
+    let sessionName: String?
+    let lastUsedAt: Date?
 }
 
 final class OAuthManager {
     private var codes: [String: OAuthCodeRecord] = [:]
     private var refreshTokens: [String: OAuthTokenRecord] = [:]
-    private let signingKey: SymmetricKey
+    private var revokedClientIds: Set<String> = []
+    private var lastUsedSaveFloorByClientId: [String: Date] = [:]
+    private var signingKey: SymmetricKey
     private let tokenQueue = DispatchQueue(label: "mac.mcp.oauth.tokens")
 
     private let codeTtl: TimeInterval = 5 * 60
@@ -30,12 +44,28 @@ final class OAuthManager {
     init() {
         signingKey = OAuthKeyStore.loadOrCreateKey()
         refreshTokens = OAuthTokenStore.load()
+        revokedClientIds = RevokedClientStore.load()
+    }
+
+    // Must be called while holding tokenQueue (i.e. from tokenQueue.sync).
+    @discardableResult
+    private func pruneRefreshTokensLocked(now: Date = Date()) -> Bool {
+        let beforeCount = refreshTokens.count
+        refreshTokens = refreshTokens.filter { token, record in
+            record.expiresAt >= now && !revokedClientIds.contains(record.clientId)
+        }
+        if refreshTokens.count != beforeCount {
+            OAuthTokenStore.save(refreshTokens)
+            return true
+        }
+        return false
     }
 
     func issueAuthorizationCode(
         clientId: String,
         redirectUri: String,
         scope: String,
+        sessionName: String?,
         codeChallenge: String?,
         codeChallengeMethod: String?
     ) -> String {
@@ -47,7 +77,8 @@ final class OAuthManager {
                 scope: scope,
                 expiresAt: Date().addingTimeInterval(codeTtl),
                 codeChallenge: codeChallenge,
-                codeChallengeMethod: codeChallengeMethod
+                codeChallengeMethod: codeChallengeMethod,
+                sessionName: sessionName
             )
             codes[code] = record
             return code
@@ -81,8 +112,14 @@ final class OAuthManager {
                 }
             }
 
+            // Remove from revoked list since they're reauthorizing
+            if revokedClientIds.contains(clientId) {
+                revokedClientIds.remove(clientId)
+                RevokedClientStore.save(revokedClientIds)
+            }
+
             let token = issueAccessToken(clientId: clientId, scope: record.scope)
-            let refreshToken = issueRefreshToken(clientId: clientId, scope: record.scope)
+            let refreshToken = issueRefreshToken(clientId: clientId, scope: record.scope, sessionName: record.sessionName)
             return (token, refreshToken, Int(tokenTtl), record.scope)
         }
     }
@@ -92,9 +129,19 @@ final class OAuthManager {
         clientId: String
     ) -> (token: String, expiresIn: Int, scope: String)? {
         return tokenQueue.sync {
-            guard let record = decodeToken(refreshToken, expectedKind: "refresh") else {
+            // Keep storage consistent and ensure revoked clients can't mint new access tokens.
+            _ = pruneRefreshTokensLocked()
+
+            guard let record = decodeToken(refreshToken, expectedKind: "refresh", key: signingKey) else {
                 return nil
             }
+
+            if revokedClientIds.contains(record.clientId) || revokedClientIds.contains(clientId) {
+                return nil
+            }
+
+            // This is a concrete "use" of the session.
+            touchClientLocked(record.clientId, now: Date())
 
             guard let stored = refreshTokens[refreshToken] else {
                 return nil
@@ -116,20 +163,127 @@ final class OAuthManager {
     }
 
     func introspect(token: String) -> OAuthTokenRecord? {
-        return decodeToken(token, expectedKind: "access")
+        return tokenQueue.sync {
+            guard let record = decodeToken(token, expectedKind: "access", key: signingKey) else {
+                return nil
+            }
+            if record.expiresAt < Date() {
+                return nil
+            }
+            if revokedClientIds.contains(record.clientId) {
+                return nil
+            }
+            return record
+        }
     }
 
     func validateBearer(_ token: String) -> Bool {
-        return introspect(token: token) != nil
+        return tokenQueue.sync {
+            guard let record = decodeToken(token, expectedKind: "access", key: signingKey) else {
+                return false
+            }
+            if record.expiresAt < Date() {
+                return false
+            }
+            guard !revokedClientIds.contains(record.clientId) else {
+                return false
+            }
+            touchClientLocked(record.clientId, now: Date())
+            return true
+        }
     }
 
     func authorizedSessionCount() -> Int {
         return tokenQueue.sync {
-            let now = Date()
-            refreshTokens = refreshTokens.filter { $0.value.expiresAt >= now }
-            OAuthTokenStore.save(refreshTokens)
+            _ = pruneRefreshTokensLocked()
             return refreshTokens.count
         }
+    }
+
+    func listRefreshTokens() -> [OAuthRefreshTokenInfo] {
+        return tokenQueue.sync {
+            _ = pruneRefreshTokensLocked()
+            let infos = refreshTokens.map { token, record in
+                OAuthRefreshTokenInfo(
+                    token: token,
+                    clientId: record.clientId,
+                    scope: record.scope,
+                    expiresAt: record.expiresAt,
+                    sessionName: record.sessionName,
+                    lastUsedAt: record.lastUsedAt
+                )
+            }
+            return infos.sorted { $0.expiresAt < $1.expiresAt }
+        }
+    }
+
+    func renameRefreshToken(_ token: String, sessionName: String?) {
+        tokenQueue.sync {
+            guard var record = refreshTokens[token] else {
+                return
+            }
+            let trimmed = sessionName?.trimmingCharacters(in: .whitespacesAndNewlines)
+            record.sessionName = (trimmed?.isEmpty == false) ? trimmed : nil
+            refreshTokens[token] = record
+            OAuthTokenStore.save(refreshTokens)
+        }
+    }
+
+    func revokeRefreshToken(_ token: String) {
+        tokenQueue.sync {
+            guard let record = refreshTokens[token] else {
+                refreshTokens.removeValue(forKey: token)
+                OAuthTokenStore.save(refreshTokens)
+                return
+            }
+
+            // Revocation is per-client (used to invalidate existing access tokens), so remove all refresh tokens
+            // for that client and prevent refresh-token exchanges until they reauthorize.
+            revokedClientIds.insert(record.clientId)
+            RevokedClientStore.save(revokedClientIds)
+            lastUsedSaveFloorByClientId.removeValue(forKey: record.clientId)
+            refreshTokens = refreshTokens.filter { _, value in
+                value.clientId != record.clientId
+            }
+            OAuthTokenStore.save(refreshTokens)
+        }
+    }
+
+    func revokeAllRefreshTokens() {
+        tokenQueue.sync {
+            // Regenerate signing key to invalidate ALL existing tokens immediately
+            signingKey = OAuthKeyStore.regenerateKey()
+            refreshTokens.removeAll()
+            revokedClientIds.removeAll()
+            lastUsedSaveFloorByClientId.removeAll()
+            OAuthTokenStore.save(refreshTokens)
+            RevokedClientStore.save(revokedClientIds)
+        }
+    }
+
+    // Must be called while holding tokenQueue.
+    private func touchClientLocked(_ clientId: String, now: Date) {
+        // Update all stored refresh tokens for this client (Sessions UI reads from refreshTokens).
+        let tokensForClient = refreshTokens
+            .filter { _, record in record.clientId == clientId }
+            .map(\.key)
+
+        guard !tokensForClient.isEmpty else {
+            return
+        }
+
+        for token in tokensForClient {
+            guard var record = refreshTokens[token] else { continue }
+            record.lastUsedAt = now
+            refreshTokens[token] = record
+        }
+
+        // Avoid writing to disk on every tool call.
+        if let floor = lastUsedSaveFloorByClientId[clientId], now.timeIntervalSince(floor) < 30 {
+            return
+        }
+        lastUsedSaveFloorByClientId[clientId] = now
+        OAuthTokenStore.save(refreshTokens)
     }
 
     private func issueAccessToken(clientId: String, scope: String) -> String {
@@ -138,29 +292,40 @@ final class OAuthManager {
             kind: "access",
             clientId: clientId,
             scope: scope,
-            expiresAt: expiresAt
+            expiresAt: expiresAt,
+            key: signingKey
         )
     }
 
-    private func issueRefreshToken(clientId: String, scope: String) -> String {
+    private func issueRefreshToken(clientId: String, scope: String, sessionName: String?) -> String {
         let expiresAt = Date().addingTimeInterval(refreshTokenTtl)
         let token = signToken(
             kind: "refresh",
             clientId: clientId,
             scope: scope,
-            expiresAt: expiresAt
+            expiresAt: expiresAt,
+            key: signingKey
         )
-        refreshTokens[token] = OAuthTokenRecord(clientId: clientId, scope: scope, expiresAt: expiresAt)
+        refreshTokens[token] = OAuthTokenRecord(
+            clientId: clientId,
+            scope: scope,
+            expiresAt: expiresAt,
+            sessionName: sessionName,
+            lastUsedAt: nil
+        )
         OAuthTokenStore.save(refreshTokens)
         return token
     }
 
-    private func signToken(kind: String, clientId: String, scope: String, expiresAt: Date) -> String {
+    private func signToken(kind: String, clientId: String, scope: String, expiresAt: Date, key: SymmetricKey) -> String {
         let header: [String: Any] = ["alg": "HS256", "typ": "JWT"]
+        let issuedAt = Date()
         let payload: [String: Any] = [
             "kind": kind,
             "client_id": clientId,
             "scope": scope,
+            "iat": Int(issuedAt.timeIntervalSince1970),
+            "jti": UUID().uuidString,
             "exp": Int(expiresAt.timeIntervalSince1970)
         ]
 
@@ -174,12 +339,12 @@ final class OAuthManager {
         let headerPart = base64UrlEncode(headerData)
         let payloadPart = base64UrlEncode(payloadData)
         let signingInput = "\(headerPart).\(payloadPart)"
-        let signature = HMAC<SHA256>.authenticationCode(for: Data(signingInput.utf8), using: signingKey)
+        let signature = HMAC<SHA256>.authenticationCode(for: Data(signingInput.utf8), using: key)
         let signaturePart = base64UrlEncode(Data(signature))
         return "\(signingInput).\(signaturePart)"
     }
 
-    private func decodeToken(_ token: String, expectedKind: String) -> OAuthTokenRecord? {
+    private func decodeToken(_ token: String, expectedKind: String, key: SymmetricKey) -> OAuthTokenRecord? {
         let parts = token.split(separator: ".")
         guard parts.count == 3 else {
             return nil
@@ -190,7 +355,7 @@ final class OAuthManager {
             return nil
         }
 
-        let expectedSignature = HMAC<SHA256>.authenticationCode(for: Data(signingInput.utf8), using: signingKey)
+        let expectedSignature = HMAC<SHA256>.authenticationCode(for: Data(signingInput.utf8), using: key)
         guard Data(expectedSignature) == signature else {
             return nil
         }
@@ -266,6 +431,8 @@ enum OAuthTokenStore {
         let clientId: String
         let scope: String
         let expiresAt: TimeInterval
+        let sessionName: String?
+        let lastUsedAt: TimeInterval?
     }
 
     static func load() -> [String: OAuthTokenRecord] {
@@ -280,7 +447,9 @@ enum OAuthTokenStore {
             tokens[entry.token] = OAuthTokenRecord(
                 clientId: entry.clientId,
                 scope: entry.scope,
-                expiresAt: Date(timeIntervalSince1970: entry.expiresAt)
+                expiresAt: Date(timeIntervalSince1970: entry.expiresAt),
+                sessionName: entry.sessionName,
+                lastUsedAt: entry.lastUsedAt.map { Date(timeIntervalSince1970: $0) }
             )
         }
         return tokens
@@ -292,7 +461,9 @@ enum OAuthTokenStore {
                 token: token,
                 clientId: record.clientId,
                 scope: record.scope,
-                expiresAt: record.expiresAt.timeIntervalSince1970
+                expiresAt: record.expiresAt.timeIntervalSince1970,
+                sessionName: record.sessionName,
+                lastUsedAt: record.lastUsedAt?.timeIntervalSince1970
             )
         }
         guard let data = try? JSONEncoder().encode(payload) else {
@@ -323,6 +494,14 @@ enum OAuthKeyStore {
             return SymmetricKey(data: keyData)
         }
 
+        return generateAndSaveKey()
+    }
+
+    static func regenerateKey() -> SymmetricKey {
+        return generateAndSaveKey()
+    }
+
+    private static func generateAndSaveKey() -> SymmetricKey {
         var bytes = [UInt8](repeating: 0, count: 32)
         let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
         if status != errSecSuccess {
@@ -333,7 +512,7 @@ enum OAuthKeyStore {
         let keyData = Data(bytes)
         let encoded = Data(keyData.base64EncodedString().utf8)
         createKeyDirectoryIfNeeded()
-        try? encoded.write(to: url, options: [.atomic])
+        try? encoded.write(to: keyUrl(), options: [.atomic])
         return SymmetricKey(data: keyData)
     }
 
@@ -346,6 +525,39 @@ enum OAuthKeyStore {
 
     private static func createKeyDirectoryIfNeeded() {
         let url = keyUrl().deletingLastPathComponent()
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+    }
+}
+
+enum RevokedClientStore {
+    static func load() -> Set<String> {
+        guard let data = try? Data(contentsOf: storeUrl()) else {
+            return []
+        }
+        guard let decoded = try? JSONDecoder().decode([String].self, from: data) else {
+            return []
+        }
+        return Set(decoded)
+    }
+
+    static func save(_ clientIds: Set<String>) {
+        let payload = Array(clientIds)
+        guard let data = try? JSONEncoder().encode(payload) else {
+            return
+        }
+        createDirectoryIfNeeded()
+        try? data.write(to: storeUrl(), options: [.atomic])
+    }
+
+    private static func storeUrl() -> URL {
+        let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        return root
+            .appendingPathComponent("MacMCPControl", isDirectory: true)
+            .appendingPathComponent("revoked_clients.json")
+    }
+
+    private static func createDirectoryIfNeeded() {
+        let url = storeUrl().deletingLastPathComponent()
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
     }
 }

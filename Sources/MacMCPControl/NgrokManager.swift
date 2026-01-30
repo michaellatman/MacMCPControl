@@ -7,10 +7,12 @@ final class NgrokManager {
     private(set) var publicUrl: String? = nil
     var onUpdate: ((String?) -> Void)?
     private var didRetry = false
+    private var ngrokExecutableUrl: URL?
 
     func start(port: Int, authToken: String) {
         stop()
         didRetry = false
+        ngrokExecutableUrl = resolveNgrokExecutable()
 
         cleanupExistingNgrok()
 
@@ -19,8 +21,15 @@ final class NgrokManager {
         }
 
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["ngrok", "http", String(port), "--log=stdout", "--log-format=json"]
+        if let ngrokExecutableUrl {
+            process.executableURL = ngrokExecutableUrl
+            process.arguments = ["http", String(port), "--log=stdout", "--log-format=json"]
+            LogStore.shared.log("Using bundled ngrok at \(ngrokExecutableUrl.path)")
+        } else {
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            process.arguments = ["ngrok", "http", String(port), "--log=stdout", "--log-format=json"]
+            LogStore.shared.log("Using ngrok from PATH")
+        }
 
         let pipe = Pipe()
         process.standardOutput = pipe
@@ -40,7 +49,7 @@ final class NgrokManager {
             self.process = process
             startPolling()
         } catch {
-            print("❌ Failed to start ngrok: \(error)")
+            LogStore.shared.log("Failed to start ngrok: \(error)", level: .error)
         }
     }
 
@@ -60,15 +69,7 @@ final class NgrokManager {
     }
 
     private func configureAuthToken(_ token: String) {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["ngrok", "config", "add-authtoken", token]
-        do {
-            try process.run()
-            process.waitUntilExit()
-        } catch {
-            print("❌ Failed to configure ngrok authtoken: \(error)")
-        }
+        _ = runNgrok(["config", "add-authtoken", token])
     }
 
     private func startPolling() {
@@ -113,7 +114,7 @@ final class NgrokManager {
     }
 
     private func cleanupExistingNgrok() {
-        runProcess(["/usr/bin/env", "ngrok", "kill"])
+        _ = runNgrok(["kill"])
         runProcess(["/usr/bin/pkill", "-f", "ngrok"])
     }
 
@@ -131,7 +132,7 @@ final class NgrokManager {
     private func logNgrok(_ message: String) {
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty {
-            print("ngrok: \(trimmed)")
+            LogStore.shared.log("ngrok: \(trimmed)")
         }
     }
 
@@ -148,5 +149,33 @@ final class NgrokManager {
         } catch {
             // Ignore cleanup failures.
         }
+    }
+
+    private func runNgrok(_ arguments: [String]) -> Process? {
+        let process = Process()
+        if let ngrokExecutableUrl {
+            process.executableURL = ngrokExecutableUrl
+            process.arguments = arguments
+        } else {
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            process.arguments = ["ngrok"] + arguments
+        }
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return process
+        } catch {
+            LogStore.shared.log("Failed to run ngrok \(arguments.joined(separator: " ")): \(error)", level: .warning)
+            return nil
+        }
+    }
+
+    private func resolveNgrokExecutable() -> URL? {
+        // SwiftPM resources are reliably accessed via Bundle.module.
+        if let url = Bundle.module.url(forResource: "ngrok", withExtension: nil) {
+            return url
+        }
+        // Fallback for non-SwiftPM packaging scenarios.
+        return Bundle.main.url(forResource: "ngrok", withExtension: nil)
     }
 }

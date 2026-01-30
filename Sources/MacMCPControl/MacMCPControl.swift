@@ -1,197 +1,331 @@
+import SwiftUI
 import AppKit
-import Foundation
 
-/// Menubar UI runner.
+// MARK: - App State
+
 @MainActor
-final class MacMCPControlMenubar: NSObject, NSApplicationDelegate {
-    private var statusItem: NSStatusItem?
-    private var statusMenuItem: NSMenuItem?
-    private var mcpMenuItem: NSMenuItem?
-    private var ngrokMenuItem: NSMenuItem?
-    private var connectedClientsMenuItem: NSMenuItem?
-    private var authorizedSessionsMenuItem: NSMenuItem?
-    private var copyNgrokMenuItem: NSMenuItem?
-    private var settingsWindow: SettingsWindow?
-    private var onboardingWindow: OnboardingWindow?
-    private var currentNgrokUrl: String?
+final class AppState: ObservableObject {
+    @Published var status: String = "Starting…"
+    @Published var mcpUrl: String = "-"
+    @Published var ngrokUrl: String?
+    @Published var ngrokConnecting: Bool = false
+    @Published var authorizedSessions: Int = 0
+    @Published var needsOnboarding: Bool = false
+    @Published var needsSettings: Bool = false
+    @Published var hasStarted: Bool = false
+
+    let settingsManager = SettingsManager()
+    lazy var mcpServerManager = McpServerManager(settingsManager: settingsManager)
+    let ngrokManager = NgrokManager()
+
     private var statsTimer: Timer?
+    private var pendingApprovalQueue: [PendingAuthRequestInfo] = []
+    private var isShowingApprovalPrompt = false
+    private let approvalPresenter = ApprovalPanelPresenter()
 
-    private let settingsManager = SettingsManager()
-    private lazy var mcpServerManager = McpServerManager(settingsManager: settingsManager)
-    private let ngrokManager = NgrokManager()
+    func handleStartup() {
+        guard !hasStarted else { return }
+        hasStarted = true
 
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.accessory)
+        LogStore.shared.log("Mac MCP Control starting.")
 
-        setupMenuBar()
+        let hasAccessibility = AccessibilityPermissions.isAccessibilityEnabled()
+        let hasScreenRecording = ScreenRecordingPermissions.isScreenRecordingEnabled()
+        let hasTerms = settingsManager.acceptedTerms
 
-        print("=== Mac MCP Control Starting (menubar) ===")
-        _ = AccessibilityPermissions.checkAndRequestPermissions()
-        handleStartup()
-    }
+        LogStore.shared.log("Permissions check - Accessibility: \(hasAccessibility), ScreenRecording: \(hasScreenRecording), Terms: \(hasTerms)")
 
-    private func handleStartup() {
-        if !settingsManager.acceptedTerms || !AccessibilityPermissions.isAccessibilityEnabled() {
-            showOnboardingWindow()
+        // If any permission is missing, reset acceptedTerms to force full onboarding
+        if !hasAccessibility || !hasScreenRecording {
+            settingsManager.acceptedTerms = false
+            needsOnboarding = true
+            LogStore.shared.log("Missing permissions - showing onboarding")
             return
         }
 
+        // All permissions granted, check if terms accepted
+        if !hasTerms {
+            needsOnboarding = true
+            LogStore.shared.log("Terms not accepted - showing onboarding")
+            return
+        }
+
+        // Everything is good, start services
+        LogStore.shared.log("All checks passed - starting services")
         if settingsManager.hasValidSettings() {
             startServices()
         } else {
-            showSettingsWindow()
+            needsSettings = true
         }
     }
 
-    @objc private func showOnboardingWindow() {
-        if onboardingWindow == nil {
-            onboardingWindow = OnboardingWindow(settingsManager: settingsManager, onContinue: { [weak self] in
-                self?.handleStartup()
-            })
-        }
-        NSApp.activate(ignoringOtherApps: true)
-        onboardingWindow?.show()
-    }
-
-    private func setupMenuBar() {
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-
-        if let button = statusItem?.button {
-            let image = createMenuBarIcon()
-            image.isTemplate = true
-            button.image = image
-        }
-
-        let menu = NSMenu()
-        let statusEntry = NSMenuItem(title: "Status: Starting…", action: nil, keyEquivalent: "")
-        let mcpItem = NSMenuItem(title: "MCP: —", action: nil, keyEquivalent: "")
-        let ngrokItem = NSMenuItem(title: "Ngrok: —", action: nil, keyEquivalent: "")
-        let connectedClientsItem = NSMenuItem(title: "Connected clients: 0", action: nil, keyEquivalent: "")
-        let authorizedSessionsItem = NSMenuItem(title: "Authorized sessions: 0", action: nil, keyEquivalent: "")
-        statusMenuItem = statusEntry
-        mcpMenuItem = mcpItem
-        ngrokMenuItem = ngrokItem
-        connectedClientsMenuItem = connectedClientsItem
-        authorizedSessionsMenuItem = authorizedSessionsItem
-
-        menu.addItem(statusEntry)
-        menu.addItem(mcpItem)
-        menu.addItem(ngrokItem)
-        menu.addItem(connectedClientsItem)
-        menu.addItem(authorizedSessionsItem)
-        let copyNgrokItem = NSMenuItem(title: "Copy Ngrok URL", action: #selector(copyNgrokUrl), keyEquivalent: "c")
-        copyNgrokItem.target = self
-        copyNgrokItem.isEnabled = false
-        copyNgrokMenuItem = copyNgrokItem
-        menu.addItem(copyNgrokItem)
-        menu.addItem(NSMenuItem.separator())
-        let settingsItem = NSMenuItem(title: "Settings…", action: #selector(showSettingsWindow), keyEquivalent: ",")
-        settingsItem.target = self
-        menu.addItem(settingsItem)
-
-        let quitItem = NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-        quitItem.target = NSApp
-        menu.addItem(quitItem)
-
-        self.statusItem?.menu = menu
-    }
-
-    @objc private func showSettingsWindow() {
-        if settingsWindow == nil {
-            settingsWindow = SettingsWindow(settingsManager: settingsManager, onSave: { [weak self] in
-                self?.restartServices()
-            })
-        }
-        NSApp.activate(ignoringOtherApps: true)
-        settingsWindow?.show()
-    }
-
-    private func startServices() {
-        mcpServerManager.onStatsUpdate = { [weak self] connected, authorized in
+    func startServices() {
+        mcpServerManager.onStatsUpdate = { [weak self] _, authorized in
             Task { @MainActor in
-                self?.updateStats(connectedClients: connected, authorizedSessions: authorized)
+                self?.authorizedSessions = authorized
+            }
+        }
+        mcpServerManager.onAuthRequest = { [weak self] request in
+            Task { @MainActor in
+                self?.enqueueApprovalPrompt(request)
             }
         }
         mcpServerManager.start()
-        updateMcpStatus()
+        mcpUrl = "http://localhost:\(settingsManager.mcpPort)/mcp"
 
         if settingsManager.ngrokEnabled {
+            ngrokConnecting = true
+            ngrokUrl = nil
             ngrokManager.onUpdate = { [weak self] url in
-                self?.updateNgrokStatus(url)
+                Task { @MainActor in
+                    self?.ngrokUrl = url
+                    self?.ngrokConnecting = (url == nil && self?.settingsManager.ngrokEnabled == true)
+                }
             }
             ngrokManager.start(port: settingsManager.mcpPort, authToken: settingsManager.ngrokAuthToken)
-            updateNgrokStatus(ngrokManager.publicUrl)
         } else {
-            updateNgrokStatus(nil)
+            ngrokConnecting = false
+            ngrokManager.stop()
+            ngrokUrl = nil
         }
 
-        updateStatus("Running")
+        status = "Running"
+        LogStore.shared.log("Status: Running")
         refreshStats()
+
         statsTimer?.invalidate()
-        statsTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true, block: { [weak self] _ in
-            DispatchQueue.main.async { [weak self] in
+        statsTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            Task { @MainActor in
                 self?.refreshStats()
             }
-        })
+        }
     }
 
-    private func restartServices() {
-        ngrokManager.stop()
-        mcpServerManager.restart()
+    func restartServices() {
+        // Centralize restart so we don't accidentally double-start the MCP server.
+        stopServices()
         startServices()
+    }
+
+    func stopServices() {
+        statsTimer?.invalidate()
+        statsTimer = nil
+        ngrokManager.stop()
+        mcpServerManager.onAuthRequest = nil
+        mcpServerManager.stop()
+        status = "Stopped"
+        ngrokUrl = nil
+        LogStore.shared.log("Status: Stopped")
+    }
+
+    func restartOnboarding() {
+        needsSettings = false
+        stopServices()
+        resetToDefaults()
+        needsOnboarding = true
+    }
+
+    func resetToDefaults() {
+        // Reset all settings to defaults
+        settingsManager.acceptedTerms = false
+        settingsManager.deviceName = Host.current().localizedName ?? "My Mac"
+        settingsManager.mcpPort = 7519
+        settingsManager.ngrokEnabled = false
+        settingsManager.ngrokAuthToken = ""
+
+        // Revoke all sessions
+        mcpServerManager.revokeAllAuthorizedSessions()
+
+        // Reset state
+        ngrokUrl = nil
+        ngrokConnecting = false
+        authorizedSessions = 0
+
+        LogStore.shared.log("Reset all settings to defaults")
+    }
+
+    func onOnboardingComplete() {
+        needsOnboarding = false
+        hasStarted = false
+        handleStartup()
+        needsSettings = !settingsManager.hasValidSettings()
     }
 
     private func refreshStats() {
         let snapshot = mcpServerManager.statsSnapshot()
-        updateStats(connectedClients: snapshot.connectedClients, authorizedSessions: snapshot.authorizedSessions)
+        authorizedSessions = snapshot.authorizedSessions
     }
 
-    private func updateStatus(_ status: String) {
-        print("Status: \(status)")
-        statusMenuItem?.title = "Status: \(status)"
+    func copyNgrokUrl() {
+        guard let url = ngrokUrl else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString("\(url)/mcp", forType: .string)
     }
 
-    private func updateMcpStatus() {
-        let localUrl = "http://localhost:\(settingsManager.mcpPort)/mcp"
-        mcpMenuItem?.title = "MCP: \(localUrl)"
+    private func enqueueApprovalPrompt(_ request: PendingAuthRequestInfo) {
+        pendingApprovalQueue.append(request)
+        showNextApprovalPromptIfNeeded()
     }
 
-    private func updateNgrokStatus(_ url: String?) {
-        currentNgrokUrl = url
-        if let url {
-            ngrokMenuItem?.title = "Ngrok: \(url)/mcp"
-            copyNgrokMenuItem?.isEnabled = true
-        } else {
-            ngrokMenuItem?.title = "Ngrok: —"
-            copyNgrokMenuItem?.isEnabled = false
-        }
-    }
-
-    private func updateStats(connectedClients: Int, authorizedSessions: Int) {
-        connectedClientsMenuItem?.title = "Connected clients: \(connectedClients)"
-        authorizedSessionsMenuItem?.title = "Authorized sessions: \(authorizedSessions)"
-    }
-
-    @objc private func copyNgrokUrl() {
-        guard let url = currentNgrokUrl else {
+    private func showNextApprovalPromptIfNeeded() {
+        guard !isShowingApprovalPrompt, let next = pendingApprovalQueue.first else {
             return
         }
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        pasteboard.setString("\(url)/mcp", forType: .string)
-    }
-    private func createMenuBarIcon() -> NSImage {
-        let image = NSImage(systemSymbolName: "rectangle.and.cursor.arrow", accessibilityDescription: "MCP")
-        return image ?? NSImage()
+        isShowingApprovalPrompt = true
+        pendingApprovalQueue.removeFirst()
+        approvalPresenter.present(
+            request: next,
+            onApprove: { [weak self] sessionName in
+                guard let self else { return }
+                self.mcpServerManager.resolveAuthRequest(
+                    requestId: next.id,
+                    approve: true,
+                    sessionName: sessionName
+                )
+                self.isShowingApprovalPrompt = false
+                self.showNextApprovalPromptIfNeeded()
+            },
+            onDeny: { [weak self] in
+                guard let self else { return }
+                self.mcpServerManager.resolveAuthRequest(
+                    requestId: next.id,
+                    approve: false,
+                    sessionName: nil
+                )
+                self.isShowingApprovalPrompt = false
+                self.showNextApprovalPromptIfNeeded()
+            }
+        )
     }
 }
 
+// MARK: - Main App
+
 @main
-struct MacMCPControlMain {
-    static func main() {
-        let app = NSApplication.shared
-        let delegate = MacMCPControlMenubar()
-        app.delegate = delegate
-        app.run()
+struct MacMCPControlApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    @StateObject private var appState: AppState
+
+    init() {
+        let state = AppState()
+        _appState = StateObject(wrappedValue: state)
+        appDelegate.appState = state
+    }
+
+    var body: some Scene {
+        MenuBarExtra {
+            MenuBarContent(appState: appState)
+        } label: {
+            MenuBarLabel(appState: appState)
+        }
+
+        Window("Mac MCP Control - Setup", id: "onboarding") {
+            OnboardingView(
+                settingsManager: appState.settingsManager,
+                onContinue: {
+                    appState.onOnboardingComplete()
+                },
+                onQuit: {
+                    appState.stopServices()
+                    NSApp.terminate(nil)
+                }
+            )
+        }
+        .windowStyle(.hiddenTitleBar)
+        .windowResizability(.contentSize)
+        .defaultPosition(.center)
+
+        Window("Mac MCP Control Settings", id: "settings") {
+            SettingsView(
+                settingsManager: appState.settingsManager,
+                mcpServerManager: appState.mcpServerManager,
+                onSave: {
+                    appState.restartServices()
+                },
+                onCancel: {},
+                onRestartOnboarding: {
+                    appState.restartOnboarding()
+                }
+            )
+            .environmentObject(appState)
+        }
+        .windowResizability(.contentSize)
+        .defaultPosition(.center)
+    }
+}
+
+// MARK: - Menu Bar Content
+
+private struct MenuBarLabel: View {
+    @ObservedObject var appState: AppState
+    @Environment(\.openWindow) private var openWindow
+    @State private var didKickoff = false
+
+    var body: some View {
+        Image(systemName: "cursorarrow.rays")
+            .task {
+                guard !didKickoff else { return }
+                didKickoff = true
+                // Defer startup until the menu bar item view is mounted; running startup too early can delay
+                // MenuBarExtra registration and make the icon appear "missing" on launch.
+                appState.handleStartup()
+                openRelevantWindowIfNeeded()
+            }
+            .onChange(of: appState.needsOnboarding) { _ in
+                openRelevantWindowIfNeeded()
+            }
+            .onChange(of: appState.needsSettings) { _ in
+                openRelevantWindowIfNeeded()
+            }
+    }
+
+    private func openRelevantWindowIfNeeded() {
+        if appState.needsOnboarding {
+            openWindow(id: "onboarding")
+            NSApp.activate(ignoringOtherApps: true)
+        } else if appState.needsSettings {
+            openWindow(id: "settings")
+            NSApp.activate(ignoringOtherApps: true)
+        }
+    }
+}
+
+struct MenuBarContent: View {
+    @ObservedObject var appState: AppState
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Group {
+            Text("Status: \(appState.status)")
+            Text("MCP: \(appState.mcpUrl)")
+            if let ngrokUrl = appState.ngrokUrl {
+                Text("Ngrok: \(ngrokUrl)/mcp")
+            } else {
+                Text("Ngrok: -")
+            }
+            Text("Authorized sessions: \(appState.authorizedSessions)")
+
+            if appState.ngrokUrl != nil {
+                Button("Copy Ngrok URL") {
+                    appState.copyNgrokUrl()
+                }
+                .keyboardShortcut("c")
+            }
+
+            Divider()
+
+            Button("Settings…") {
+                openWindow(id: "settings")
+                NSApp.activate(ignoringOtherApps: true)
+            }
+            .keyboardShortcut(",")
+            .disabled(appState.needsOnboarding || !appState.settingsManager.acceptedTerms)
+
+            Button("Quit") {
+                appState.stopServices()
+                NSApp.terminate(nil)
+            }
+            .keyboardShortcut("q")
+        }
     }
 }

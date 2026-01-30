@@ -49,7 +49,7 @@ class ActionExecutor {
             }
         }
 
-        print("➤ Executing action: \(actionType)")
+        LogStore.shared.log("Executing action: \(actionType)")
 
         switch actionType {
         case "mouse_move":
@@ -76,8 +76,6 @@ class ActionExecutor {
             return try executeWait(params: params)
         case "shell":
             return try executeShell(params: params)
-        case "applescript":
-            return try executeAppleScript(params: params)
         case "scroll":
             return try executeScroll(params: params)
         default:
@@ -193,6 +191,10 @@ class ActionExecutor {
     }
 
     private func executeScreenshot(params: [String: Any]) throws -> [String: Any] {
+        if !ScreenRecordingPermissions.isScreenRecordingEnabled() {
+            throw ActionError.executionFailed("Screen recording permission not granted. Enable it in System Settings > Privacy & Security > Screen Recording.")
+        }
+
         guard let displayID = CGMainDisplayID() as CGDirectDisplayID? else {
             throw ActionError.executionFailed("Failed to get main display")
         }
@@ -385,16 +387,24 @@ class ActionExecutor {
 
         let keyMap: [String: CGKeyCode] = [
             "enter": 0x24,
+            "return": 0x24,
             "tab": 0x30,
             "space": 0x31,
+            "spacebar": 0x31,
             "backspace": 0x33,
             "escape": 0x35,
+            "esc": 0x35,
             "capslock": 0x39,
             "shift": 0x38,
             "control": 0x3B,
+            "ctrl": 0x3B,
             "alt": 0x3A,
+            "option": 0x3A,
+            "opt": 0x3A,
             "meta": 0x37,
             "super": 0x37,
+            "command": 0x37,
+            "cmd": 0x37,
             "delete": 0x75,
             "home": 0x73,
             "end": 0x77,
@@ -429,9 +439,14 @@ class ActionExecutor {
         let normalized = key.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return normalized == "shift"
             || normalized == "control"
+            || normalized == "ctrl"
             || normalized == "alt"
+            || normalized == "option"
+            || normalized == "opt"
             || normalized == "meta"
             || normalized == "super"
+            || normalized == "command"
+            || normalized == "cmd"
     }
 
     private func mapCharToKeyCode(_ char: Character) -> CGKeyCode? {
@@ -484,27 +499,6 @@ class ActionExecutor {
         } catch {
             throw ActionError.executionFailed("Failed to execute command: \(error.localizedDescription)")
         }
-    }
-
-    private func executeAppleScript(params: [String: Any]) throws -> [String: Any] {
-        guard let script = params["script"] as? String else {
-            throw ActionError.invalidParameters("Missing script parameter")
-        }
-
-        var error: NSDictionary?
-        let appleScript = NSAppleScript(source: script)
-        let output = appleScript?.executeAndReturnError(&error)
-
-        if let error = error {
-            let errorMessage = error["NSAppleScriptErrorMessage"] as? String ?? "Unknown AppleScript error"
-            throw ActionError.executionFailed("AppleScript execution failed: \(errorMessage)")
-        }
-
-        let result = output?.stringValue ?? ""
-        return [
-            "success": true,
-            "result": result
-        ]
     }
 
     private func executeScroll(params: [String: Any]) throws -> [String: Any] {

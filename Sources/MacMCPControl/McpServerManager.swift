@@ -1,15 +1,37 @@
 import Foundation
 import Swifter
 
+struct PendingAuthRequestInfo: Identifiable, Hashable {
+    let id: String
+    let clientId: String
+    let redirectUri: String
+    let scope: String
+    let source: String
+    let confirmCode: String
+    let codeChallengeMethod: String?
+    let createdAt: Date
+}
+
 private struct PendingAuthRequest {
     let id: String
     let clientId: String
     let redirectUri: String
     let state: String
     let scope: String
-    let sourceHost: String
+    let source: String
+    let pollToken: String
+    let confirmCode: String
+    var sessionName: String?
     let codeChallenge: String?
     let codeChallengeMethod: String?
+    let createdAt: Date
+    var decision: PendingAuthDecision
+}
+
+private enum PendingAuthDecision: Equatable {
+    case pending
+    case approved(code: String)
+    case denied
 }
 
 final class McpServerManager {
@@ -26,7 +48,10 @@ final class McpServerManager {
     private var pendingAuthRequests: [String: PendingAuthRequest] = [:]
     private var registeredClients: Set<String> = []
     private var lastExternalBaseUrl: String?
+    private let authQueue = DispatchQueue(label: "mac.mcp.oauth.flow")
+    private let pendingAuthTtl: TimeInterval = 10 * 60
     var onStatsUpdate: StatsUpdateHandler?
+    var onAuthRequest: (@Sendable (PendingAuthRequestInfo) -> Void)?
 
     init(settingsManager: SettingsManager) {
         self.settingsManager = settingsManager
@@ -69,20 +94,20 @@ final class McpServerManager {
             return self.handleAuthorize(request)
         }
 
-        server.GET["/approval"] = { [weak self] request in
+        server.GET["/oauth/approve"] = { [weak self] request in
             guard let self else {
                 return .internalServerError
             }
             self.logRequest(request)
-            return self.handleApprovalPage(request)
+            return self.handleApprovePage(request)
         }
 
-        server.POST["/approval"] = { [weak self] request in
+        server.GET["/oauth/pending"] = { [weak self] request in
             guard let self else {
                 return .internalServerError
             }
             self.logRequest(request)
-            return self.handleApprovalDecision(request)
+            return self.handlePendingAuth(request)
         }
 
         server.POST["/oauth/token"] = { [weak self] request in
@@ -136,9 +161,9 @@ final class McpServerManager {
         do {
             try server.start(UInt16(settingsManager.mcpPort))
             isRunning = true
-            print("MCP server listening on http://localhost:\(settingsManager.mcpPort)/mcp")
+            LogStore.shared.log("MCP server listening on http://localhost:\(settingsManager.mcpPort)/mcp")
         } catch {
-            print("❌ Failed to start MCP server: \(error)")
+            LogStore.shared.log("Failed to start MCP server: \(error)", level: .error)
         }
     }
 
@@ -282,7 +307,6 @@ final class McpServerManager {
             "cursor_position",
             "wait",
             "shell",
-            "applescript",
             "scroll"
         ]
 
@@ -303,8 +327,7 @@ final class McpServerManager {
                     "maxItems": 2
                 ],
                 "duration": ["type": "number"],
-                "command": ["type": "string"],
-                "script": ["type": "string"],
+                "command": ["type": "string", "description": "Shell command to execute. To run AppleScript, use osascript (e.g. osascript -e 'tell application \"System Events\" to keystroke \"a\" using command down')."],
                 "direction": ["type": "string", "enum": ["up", "down", "left", "right"]],
                 "amount": ["type": "integer"]
             ],
@@ -317,7 +340,7 @@ final class McpServerManager {
         let tools: [[String: Any]] = [
             [
                 "name": "computer",
-                "description": "Run multiple computer actions in order: type, wait, click, etc, and optionally take a screenshot (must be last).",
+                "description": "Run multiple computer actions in order: type, wait, click, etc, and optionally take a screenshot (must be last). To run AppleScript, use the shell action with osascript (e.g. command: \"osascript -e 'tell application \\\"System Events\\\" to keystroke \\\"a\\\" using command down'\").",
                 "inputSchema": [
                     "type": "object",
                     "properties": [
@@ -327,18 +350,6 @@ final class McpServerManager {
                         ]
                     ],
                     "required": ["actions"]
-                ]
-            ],
-            [
-                "name": "open_computer_fullscreen",
-                "description": "Prompt the user to open the computer in full-screen mode.",
-                "inputSchema": [
-                    "type": "object",
-                    "properties": [
-                        "interactive": ["type": "boolean"],
-                        "message": ["type": "string"]
-                    ],
-                    "required": []
                 ]
             ],
             [
@@ -369,8 +380,6 @@ final class McpServerManager {
         switch name {
         case "computer":
             return handleComputerTool(requestId: requestId, arguments: arguments)
-        case "open_computer_fullscreen":
-            return handleFullscreenTool(requestId: requestId, arguments: arguments)
         case "local_computer_status":
             return handleStatusTool(requestId: requestId)
         default:
@@ -458,29 +467,6 @@ final class McpServerManager {
         return jsonRpcResponse(id: requestId, result: ["content": content])
     }
 
-    private func handleFullscreenTool(requestId: Any?, arguments: [String: Any]) -> HttpResponse {
-        let interactive = (arguments["interactive"] as? Bool) ?? false
-        let message = (arguments["message"] as? String) ?? ""
-
-        let summary = interactive
-            ? "Prompted the user to open the computer in interactive full screen mode."
-            : "Prompted the user to open the computer in view-only full screen mode."
-
-        var text = summary
-        if !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            text += "\nMessage: \(message)"
-        }
-
-        return jsonRpcResponse(id: requestId, result: [
-            "content": [
-                [
-                    "type": "text",
-                    "text": text
-                ]
-            ]
-        ])
-    }
-
     private func handleStatusTool(requestId: Any?) -> HttpResponse {
         let localComputerId = settingsManager.localComputerId ?? generateAndStoreLocalComputerId()
         let text = "Local computer ready: \(settingsManager.deviceName) (localComputerId=\(localComputerId))."
@@ -533,6 +519,20 @@ final class McpServerManager {
         }
     }
 
+    func listAuthorizedSessions() -> [OAuthRefreshTokenInfo] {
+        return oauthManager.listRefreshTokens()
+    }
+
+    func revokeAuthorizedSession(_ token: String) {
+        oauthManager.revokeRefreshToken(token)
+        emitStatsUpdate()
+    }
+
+    func revokeAllAuthorizedSessions() {
+        oauthManager.revokeAllRefreshTokens()
+        emitStatsUpdate()
+    }
+
     private func emitStatsUpdate() {
         let snapshot = computeSnapshotLocked()
         notifyStatsUpdate(connected: snapshot.connectedClients, authorized: snapshot.authorizedSessions)
@@ -555,7 +555,9 @@ final class McpServerManager {
     }
 
     private func handleAuthServerMetadata(_ request: HttpRequest) -> HttpResponse {
-        let issuer = localBaseUrl()
+        // Use the request base URL (supports ngrok via X-Forwarded-* headers) so remote clients don't
+        // get directed to localhost on their own machine.
+        let issuer = baseUrl(for: request)
         let metadata: [String: Any] = [
             "issuer": issuer,
             "authorization_endpoint": "\(issuer)/oauth/authorize",
@@ -573,11 +575,11 @@ final class McpServerManager {
     }
 
     private func handleProtectedResourceMetadata(_ request: HttpRequest) -> HttpResponse {
-        let resourceBase = lastExternalBaseUrl ?? baseUrl(for: request)
+        let resourceBase = baseUrl(for: request)
         let resource = "\(resourceBase)/mcp"
         let metadata: [String: Any] = [
             "resource": resource,
-            "authorization_servers": [localBaseUrl()]
+            "authorization_servers": [resourceBase]
         ]
         return jsonResponse(metadata)
     }
@@ -596,61 +598,114 @@ final class McpServerManager {
             return jsonResponse(["error": "invalid_request", "error_description": "Missing parameters"])
         }
 
+        // We intentionally allow any redirect URI, but we surface it in the approval UI so the user can
+        // validate they're approving the right callback destination.
+        guard isValidRedirectUri(redirectUri) else {
+            LogStore.shared.log("OAuth authorize error: invalid redirect_uri=\(redirectUri)", level: .warning)
+            return jsonResponse(["error": "invalid_request", "error_description": "invalid redirect_uri"])
+        }
+
         let requestId = "auth_\(UUID().uuidString)"
-        let sourceHost = headerValue(request, name: "x-forwarded-host") ?? headerValue(request, name: "host") ?? "unknown"
-        pendingAuthRequests[requestId] = PendingAuthRequest(
+        let pollToken = "poll_\(UUID().uuidString)"
+        let confirmCode = String(format: "%06d", Int.random(in: 0..<1_000_000))
+        // For UX only; don't trust forwarded headers here.
+        let source = request.address ?? (headerValue(request, name: "host") ?? "unknown")
+        let now = Date()
+        authQueue.sync {
+            prunePendingAuthRequestsLocked(now: now)
+            pendingAuthRequests[requestId] = PendingAuthRequest(
+                id: requestId,
+                clientId: clientId,
+                redirectUri: redirectUri,
+                state: state,
+                scope: scope,
+                source: source,
+                pollToken: pollToken,
+                confirmCode: confirmCode,
+                sessionName: nil,
+                codeChallenge: codeChallenge,
+                codeChallengeMethod: codeChallengeMethod,
+                createdAt: now,
+                decision: .pending
+            )
+        }
+
+        let info = PendingAuthRequestInfo(
             id: requestId,
             clientId: clientId,
             redirectUri: redirectUri,
-            state: state,
             scope: scope,
-            sourceHost: sourceHost,
-            codeChallenge: codeChallenge,
-            codeChallengeMethod: codeChallengeMethod
+            source: source,
+            confirmCode: confirmCode,
+            codeChallengeMethod: codeChallengeMethod,
+            createdAt: now
         )
+        let handler = onAuthRequest
+        DispatchQueue.main.async {
+            handler?(info)
+        }
 
-        let approvalUrl = "\(localBaseUrl())/approval?request_id=\(requestId)"
+        // Use the request base URL so this works both locally and via ngrok/public hosts.
+        let approvalUrl = "\(baseUrl(for: request))/oauth/approve?request_id=\(requestId)"
         return .raw(302, "Found", ["Location": approvalUrl], { _ in })
     }
 
-    private func handleApprovalPage(_ request: HttpRequest) -> HttpResponse {
-        guard isLocalRequest(request) else {
-            return .raw(403, "Forbidden", nil, { _ in })
-        }
-
+    private func handleApprovePage(_ request: HttpRequest) -> HttpResponse {
         let query = queryParamsDict(request.queryParams)
         let requestId = query["request_id"] ?? ""
-        guard let pending = pendingAuthRequests[requestId] else {
+        guard let pending = authQueue.sync(execute: { pendingAuthRequests[requestId] }) else {
             return .raw(404, "Not Found", nil, { _ in })
         }
+
+        let requestIdJs = escapeHtml(requestId)
+        let pollTokenJs = escapeHtml(pending.pollToken)
+        let confirmCodeEsc = escapeHtml(pending.confirmCode)
+        let clientIdEsc = escapeHtml(pending.clientId)
+        let redirectEsc = escapeHtml(pending.redirectUri)
+        let scopeEsc = escapeHtml(pending.scope)
+        let sourceEsc = escapeHtml(pending.source)
 
         let html = """
         <html>
           <head>
-            <title>Approve Access</title>
+            <title>Approve In App</title>
             <style>
               body { font-family: -apple-system, Helvetica, Arial, sans-serif; padding: 24px; }
               .box { border: 1px solid #ddd; padding: 16px; border-radius: 8px; max-width: 520px; }
               .meta { color: #444; font-size: 13px; margin-top: 8px; }
-              button { margin-right: 12px; padding: 8px 16px; }
+              .code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace; font-size: 24px; letter-spacing: 2px; background: #f4f4f4; border-radius: 8px; padding: 10px 12px; display: inline-block; }
               code { word-break: break-all; }
             </style>
           </head>
           <body>
             <div class="box">
-              <h2>Approve MCP Access</h2>
-              <p><strong>Request from</strong>: <code>\(escapeHtml(pending.sourceHost))</code></p>
-              <p><strong>Client</strong>: <code>\(escapeHtml(pending.clientId))</code></p>
-              <p><strong>Redirect</strong>: <code>\(escapeHtml(pending.redirectUri))</code></p>
-              <p><strong>Scope</strong>: <code>\(escapeHtml(pending.scope))</code></p>
-              <p><strong>PKCE</strong>: <code>\(escapeHtml(pending.codeChallengeMethod ?? "plain"))</code></p>
-              <form method="post" action="/approval">
-                <input type="hidden" name="request_id" value="\(escapeHtml(pending.id))" />
-                <button type="submit" name="decision" value="approve">Approve</button>
-                <button type="submit" name="decision" value="deny">Deny</button>
-              </form>
-              <div class="meta">This page is served from localhost. Only approve if you initiated the request.</div>
+              <h2>Approve In Mac MCP Control</h2>
+              <p>This request can only be approved inside the Mac MCP Control app.</p>
+              <p><strong>Confirm code</strong>: <span class="code">\(confirmCodeEsc)</span></p>
+              <p><strong>Client</strong>: <code>\(clientIdEsc)</code></p>
+              <p><strong>Redirect</strong>: <code>\(redirectEsc)</code></p>
+              <p><strong>Scope</strong>: <code>\(scopeEsc)</code></p>
+              <p><strong>Request from</strong>: <code>\(sourceEsc)</code></p>
+              <div class="meta">Open the Mac MCP Control app to approve/deny. This page will continue automatically.</div>
             </div>
+            <script>
+              const requestId = "\(requestIdJs)";
+              const pollToken = "\(pollTokenJs)";
+              async function poll() {
+                try {
+                  const res = await fetch(`/oauth/pending?request_id=${encodeURIComponent(requestId)}&poll_token=${encodeURIComponent(pollToken)}`, { cache: "no-store" });
+                  const body = await res.json();
+                  if (body && body.status && body.status !== "pending" && body.redirect) {
+                    window.location = body.redirect;
+                    return;
+                  }
+                } catch (e) {
+                  // ignore
+                }
+                setTimeout(poll, 500);
+              }
+              poll();
+            </script>
           </body>
         </html>
         """
@@ -660,52 +715,123 @@ final class McpServerManager {
         })
     }
 
-    private func handleApprovalDecision(_ request: HttpRequest) -> HttpResponse {
-        guard isLocalRequest(request) else {
-            return .raw(403, "Forbidden", nil, { _ in })
+    private func handlePendingAuth(_ request: HttpRequest) -> HttpResponse {
+        let query = queryParamsDict(request.queryParams)
+        let requestId = query["request_id"] ?? ""
+        let pollToken = query["poll_token"] ?? ""
+
+        guard !requestId.isEmpty else {
+            return jsonResponse(["status": "invalid_request"], headers: ["Cache-Control": "no-store"])
         }
 
-        guard let params = parseFormBody(request.body) else {
-            return jsonResponse(["error": "invalid_request", "error_description": "Invalid body"])
+        guard let pending = authQueue.sync(execute: { pendingAuthRequests[requestId] }) else {
+            return jsonResponse(["status": "unknown_request"], headers: ["Cache-Control": "no-store"])
         }
 
-        let requestId = params["request_id"] ?? ""
-        let decision = params["decision"] ?? ""
-
-        guard let pending = pendingAuthRequests.removeValue(forKey: requestId) else {
-            return jsonResponse(["error": "invalid_request", "error_description": "Unknown request"])
+        if Date().timeIntervalSince(pending.createdAt) > pendingAuthTtl {
+            authQueue.sync { () -> Void in
+                pendingAuthRequests.removeValue(forKey: requestId)
+            }
+            return jsonResponse(["status": "expired"], headers: ["Cache-Control": "no-store"])
         }
 
-        guard let redirectUrl = URL(string: pending.redirectUri) else {
-            return jsonResponse(["error": "invalid_request", "error_description": "Invalid redirect URI"])
+        guard !pollToken.isEmpty, pollToken == pending.pollToken else {
+            return jsonResponse(["status": "forbidden"], headers: ["Cache-Control": "no-store"])
+        }
+
+        switch pending.decision {
+        case .pending:
+            return jsonResponse(["status": "pending"], headers: ["Cache-Control": "no-store"])
+        case .approved(let code):
+            let redirect = buildRedirect(redirectUri: pending.redirectUri, state: pending.state, code: code, error: nil)
+            authQueue.sync { () -> Void in
+                pendingAuthRequests.removeValue(forKey: requestId)
+            }
+            return jsonResponse([
+                "status": "approved",
+                "redirect": redirect
+            ], headers: ["Cache-Control": "no-store"])
+        case .denied:
+            let redirect = buildRedirect(redirectUri: pending.redirectUri, state: pending.state, code: nil, error: "access_denied")
+            authQueue.sync { () -> Void in
+                pendingAuthRequests.removeValue(forKey: requestId)
+            }
+            return jsonResponse([
+                "status": "denied",
+                "redirect": redirect
+            ], headers: ["Cache-Control": "no-store"])
+        }
+    }
+
+    private func buildRedirect(redirectUri: String, state: String, code: String?, error: String?) -> String {
+        guard let redirectUrl = URL(string: redirectUri) else {
+            return redirectUri
         }
 
         var components = URLComponents(url: redirectUrl, resolvingAgainstBaseURL: false)
         var items = components?.queryItems ?? []
 
-        if decision == "approve" {
+        if let code {
+            items.append(URLQueryItem(name: "code", value: code))
+        }
+        if let error {
+            items.append(URLQueryItem(name: "error", value: error))
+        }
+        if !state.isEmpty {
+            items.append(URLQueryItem(name: "state", value: state))
+        }
+
+        components?.queryItems = items
+        return components?.url?.absoluteString ?? redirectUri
+    }
+
+    func resolveAuthRequest(requestId: String, approve: Bool, sessionName: String?) {
+        let pending: PendingAuthRequest? = authQueue.sync {
+            pendingAuthRequests[requestId]
+        }
+        guard let pending else { return }
+
+        if Date().timeIntervalSince(pending.createdAt) > pendingAuthTtl {
+            authQueue.sync { () -> Void in
+                pendingAuthRequests.removeValue(forKey: requestId)
+            }
+            return
+        }
+
+        if approve {
             let code = oauthManager.issueAuthorizationCode(
                 clientId: pending.clientId,
                 redirectUri: pending.redirectUri,
                 scope: pending.scope,
+                sessionName: sessionName,
                 codeChallenge: pending.codeChallenge,
                 codeChallengeMethod: pending.codeChallengeMethod
             )
-            items.append(URLQueryItem(name: "code", value: code))
+            authQueue.sync {
+                guard var current = pendingAuthRequests[requestId], current.decision == .pending else { return }
+                current.decision = .approved(code: code)
+                current.sessionName = sessionName
+                pendingAuthRequests[requestId] = current
+            }
         } else {
-            items.append(URLQueryItem(name: "error", value: "access_denied"))
+            authQueue.sync {
+                guard var current = pendingAuthRequests[requestId], current.decision == .pending else { return }
+                current.decision = .denied
+                pendingAuthRequests[requestId] = current
+            }
         }
+    }
 
-        if !pending.state.isEmpty {
-            items.append(URLQueryItem(name: "state", value: pending.state))
+    // Must be called while holding authQueue.
+    private func prunePendingAuthRequestsLocked(now: Date) {
+        pendingAuthRequests = pendingAuthRequests.filter { _, value in
+            now.timeIntervalSince(value.createdAt) <= pendingAuthTtl
         }
+    }
 
-        components?.queryItems = items
-        guard let redirect = components?.url else {
-            return jsonResponse(["error": "invalid_request", "error_description": "Invalid redirect URI"])
-        }
-
-        return .raw(302, "Found", ["Location": redirect.absoluteString], { _ in })
+    func renameAuthorizedSession(_ token: String, sessionName: String?) {
+        oauthManager.renameRefreshToken(token, sessionName: sessionName)
+        emitStatsUpdate()
     }
 
     private func handleToken(_ request: HttpRequest) -> HttpResponse {
@@ -720,20 +846,20 @@ final class McpServerManager {
         let refreshToken = params["refresh_token"] ?? ""
         let codeVerifier = params["code_verifier"]
 
-        print("OAuth token request grant_type=\(grantType) client_id=\(clientId) has_code=\(!code.isEmpty) has_verifier=\(codeVerifier != nil) redirect_uri=\(redirectUri)")
+        LogStore.shared.log("OAuth token request grant_type=\(grantType) client_id=\(clientId) has_code=\(!code.isEmpty) has_verifier=\(codeVerifier != nil) redirect_uri=\(redirectUri)")
 
         if clientId.isEmpty {
-            print("OAuth token error: missing client_id")
+            LogStore.shared.log("OAuth token error: missing client_id", level: .warning)
             return jsonResponse(["error": "invalid_request", "error_description": "Missing client_id"])
         }
 
         if grantType == "authorization_code" && (code.isEmpty || redirectUri.isEmpty) {
-            print("OAuth token error: missing parameters")
+            LogStore.shared.log("OAuth token error: missing parameters", level: .warning)
             return jsonResponse(["error": "invalid_request", "error_description": "Missing parameters"])
         }
 
         if !registeredClients.contains(clientId) {
-            print("OAuth token: unknown client_id \(clientId), allowing and registering dynamically")
+            LogStore.shared.log("OAuth token: unknown client_id \(clientId), allowing and registering dynamically")
             registeredClients.insert(clientId)
         }
 
@@ -744,7 +870,7 @@ final class McpServerManager {
                 redirectUri: redirectUri,
                 codeVerifier: codeVerifier
             ) else {
-                print("OAuth token error: invalid grant for client_id=\(clientId)")
+                LogStore.shared.log("OAuth token error: invalid grant for client_id=\(clientId)", level: .warning)
                 return jsonResponse(["error": "invalid_grant", "error_description": "Invalid code"])
             }
 
@@ -756,19 +882,19 @@ final class McpServerManager {
                 "expires_in": result.expiresIn,
                 "scope": result.scope
             ]
-            print("Issued OAuth token for client=\(clientId) scope=\"\(result.scope)\" keys=\(response.keys.sorted())")
+            LogStore.shared.log("Issued OAuth token for client=\(clientId) scope=\"\(result.scope)\" keys=\(response.keys.sorted())")
             emitStatsUpdate()
             return jsonResponse(response)
         }
 
         if grantType == "refresh_token" {
             if refreshToken.isEmpty {
-                print("OAuth token error: missing refresh_token")
+                LogStore.shared.log("OAuth token error: missing refresh_token", level: .warning)
                 return jsonResponse(["error": "invalid_request", "error_description": "Missing refresh_token"])
             }
 
             guard let result = oauthManager.exchangeRefreshToken(refreshToken: refreshToken, clientId: clientId) else {
-                print("OAuth token error: invalid refresh_token for client_id=\(clientId)")
+                LogStore.shared.log("OAuth token error: invalid refresh_token for client_id=\(clientId)", level: .warning)
                 return jsonResponse(["error": "invalid_grant", "error_description": "Invalid refresh_token"])
             }
 
@@ -779,12 +905,12 @@ final class McpServerManager {
                 "expires_in": result.expiresIn,
                 "scope": result.scope
             ]
-            print("Issued OAuth refresh token for client=\(clientId) scope=\"\(result.scope)\" keys=\(response.keys.sorted())")
+            LogStore.shared.log("Issued OAuth refresh token for client=\(clientId) scope=\"\(result.scope)\" keys=\(response.keys.sorted())")
             emitStatsUpdate()
             return jsonResponse(response)
         }
 
-        print("OAuth token error: unsupported grant_type \(grantType)")
+        LogStore.shared.log("OAuth token error: unsupported grant_type \(grantType)", level: .warning)
         return jsonResponse(["error": "unsupported_grant_type", "error_description": "Unsupported grant_type"])
     }
 
@@ -842,10 +968,10 @@ final class McpServerManager {
     }
 
     private func unauthorizedResponse(_ request: HttpRequest, reason: String) -> HttpResponse {
-        print("HTTP 401 Unauthorized: \(reason)")
+        LogStore.shared.log("HTTP 401 Unauthorized: \(reason)", level: .warning)
         let base = baseUrl(for: request)
         let resource = "\(base)/mcp"
-        let authServer = localBaseUrl()
+        let authServer = base
         let resourceMetadata = "\(authServer)/.well-known/oauth-protected-resource/mcp"
         let headerValue = "Bearer realm=\"mac-mcp-control\", resource=\"\(resource)\", authorization_uri=\"\(authServer)/oauth/authorize\", resource_metadata=\"\(resourceMetadata)\""
         return .raw(401, "Unauthorized", ["WWW-Authenticate": headerValue], { _ in })
@@ -922,10 +1048,28 @@ final class McpServerManager {
     }
 
     private func isLocalRequest(_ request: HttpRequest) -> Bool {
-        guard let hostHeader = headerValue(request, name: "host") else {
+        // Never trust Host/X-Forwarded-* here; require an actual loopback socket peer.
+        guard let address = request.address else {
             return false
         }
-        return isLocalHostHeader(hostHeader)
+        return isLoopbackPeerAddress(address)
+    }
+
+    private func isLoopbackPeerAddress(_ address: String) -> Bool {
+        // Swifter formats this as "<ip>:<port>" (e.g. "127.0.0.1:12345").
+        let host = address.split(separator: ":").first.map(String.init) ?? address
+        return host == "127.0.0.1" || host == "::1" || host == "localhost"
+    }
+
+    private func isValidRedirectUri(_ redirectUri: String) -> Bool {
+        guard let url = URL(string: redirectUri) else {
+            return false
+        }
+        // Require a scheme so the user sees an unambiguous destination.
+        guard let scheme = url.scheme, !scheme.isEmpty else {
+            return false
+        }
+        return true
     }
 
     private func decodeQueryValue(_ value: String) -> String {
@@ -953,7 +1097,7 @@ final class McpServerManager {
         }
         let bodySize = request.body.count
         let address = request.address ?? "unknown"
-        print("HTTP \(request.method) \(pathWithQuery) from \(address) headers=\(headers) bodyBytes=\(bodySize)")
+        LogStore.shared.log("HTTP \(request.method) \(pathWithQuery) from \(address) headers=\(headers) bodyBytes=\(bodySize)")
     }
 
     private func jsonRpcResponse(id: Any?, result: [String: Any], headers: [String: String] = [:]) -> HttpResponse {
