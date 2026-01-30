@@ -28,6 +28,10 @@ A native macOS menubar app that hosts a local MCP (Model Context Protocol) serve
 
 ## Installation
 
+### Releases
+
+Download the latest build from the [Releases page](https://github.com/michaellatman/MacMCPControl/releases).
+
 ### Building from Source
 
 ```bash
