@@ -33,7 +33,9 @@ jobs:
 
           # Import certificate
           CERTIFICATE_PATH=$RUNNER_TEMP/certificate.p12
+          echo "APPLE_CERTIFICATE_BASE64 length: ${#APPLE_CERTIFICATE_BASE64} bytes"
           echo "$APPLE_CERTIFICATE_BASE64" | base64 --decode > "$CERTIFICATE_PATH"
+          echo "Decoded certificate size: $(wc -c < "$CERTIFICATE_PATH") bytes"
 
           security import "$CERTIFICATE_PATH" \
             -P "$APPLE_CERTIFICATE_PASSWORD" \
