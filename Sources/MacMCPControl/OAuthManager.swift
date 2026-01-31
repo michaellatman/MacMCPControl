@@ -495,6 +495,7 @@ enum OAuthTokenStore {
             return [:]
         }
 
+        LogStore.shared.log("Migrated refresh tokens from disk to Keychain.")
         KeychainStore.save(account: "refresh_tokens", data: data)
         try? FileManager.default.removeItem(at: storeUrl())
         return decodeTokens(decoded)
@@ -524,11 +525,6 @@ enum OAuthTokenStore {
             .appendingPathComponent("refresh_tokens.json")
     }
 
-    private static func createDirectoryIfNeeded() {
-        let url = storeUrl().deletingLastPathComponent()
-        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-    }
-
     private static func decodeTokens(_ decoded: [PersistedToken]) -> [String: OAuthTokenRecord] {
         var tokens: [String: OAuthTokenRecord] = [:]
         for entry in decoded {
@@ -553,6 +549,7 @@ enum OAuthKeyStore {
         let url = keyUrl()
         if let data = try? Data(contentsOf: url),
            let keyData = Data(base64Encoded: data) {
+            LogStore.shared.log("Migrated OAuth signing key from disk to Keychain.")
             KeychainStore.save(account: "oauth_signing_key", data: keyData)
             try? FileManager.default.removeItem(at: url)
             return SymmetricKey(data: keyData)
@@ -584,11 +581,6 @@ enum OAuthKeyStore {
             .appendingPathComponent("MacMCPControl", isDirectory: true)
             .appendingPathComponent("oauth_signing_key")
     }
-
-    private static func createKeyDirectoryIfNeeded() {
-        let url = keyUrl().deletingLastPathComponent()
-        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-    }
 }
 
 enum RevokedClientStore {
@@ -603,6 +595,7 @@ enum RevokedClientStore {
             return []
         }
 
+        LogStore.shared.log("Migrated revoked clients from disk to Keychain.")
         KeychainStore.save(account: "revoked_clients", data: data)
         try? FileManager.default.removeItem(at: storeUrl())
         return Set(decoded)
@@ -621,10 +614,5 @@ enum RevokedClientStore {
         return root
             .appendingPathComponent("MacMCPControl", isDirectory: true)
             .appendingPathComponent("revoked_clients.json")
-    }
-
-    private static func createDirectoryIfNeeded() {
-        let url = storeUrl().deletingLastPathComponent()
-        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
     }
 }
