@@ -298,11 +298,6 @@ struct MenuBarContent: View {
         Group {
             Text("Status: \(appState.status)")
             Text("MCP: \(appState.mcpUrl)")
-            if let ngrokUrl = appState.ngrokUrl {
-                Text("Ngrok: \(ngrokUrl)/mcp")
-            } else {
-                Text("Ngrok: -")
-            }
             Text("Authorized sessions: \(appState.authorizedSessions)")
 
             if appState.ngrokUrl != nil {
