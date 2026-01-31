@@ -2,6 +2,55 @@ import Foundation
 import CryptoKit
 import Security
 
+private enum KeychainStore {
+    private static let service = "MacMCPControl"
+
+    static func load(account: String) -> Data? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecReturnData as String: true
+        ]
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        guard status == errSecSuccess else {
+            return nil
+        }
+        return item as? Data
+    }
+
+    static func save(account: String, data: Data) {
+        let attributes: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+            kSecValueData as String: data
+        ]
+
+        let updateQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account
+        ]
+
+        let status = SecItemUpdate(updateQuery as CFDictionary, [kSecValueData as String: data] as CFDictionary)
+        if status == errSecItemNotFound {
+            _ = SecItemAdd(attributes as CFDictionary, nil)
+        }
+    }
+
+    static func delete(account: String) {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account
+        ]
+        _ = SecItemDelete(query as CFDictionary)
+    }
+}
+
 struct OAuthCodeRecord {
     let clientId: String
     let redirectUri: String
@@ -436,23 +485,19 @@ enum OAuthTokenStore {
     }
 
     static func load() -> [String: OAuthTokenRecord] {
-        guard let data = try? Data(contentsOf: storeUrl()) else {
+        if let data = KeychainStore.load(account: "refresh_tokens"),
+           let decoded = try? JSONDecoder().decode([PersistedToken].self, from: data) {
+            return decodeTokens(decoded)
+        }
+
+        guard let data = try? Data(contentsOf: storeUrl()),
+              let decoded = try? JSONDecoder().decode([PersistedToken].self, from: data) else {
             return [:]
         }
-        guard let decoded = try? JSONDecoder().decode([PersistedToken].self, from: data) else {
-            return [:]
-        }
-        var tokens: [String: OAuthTokenRecord] = [:]
-        for entry in decoded {
-            tokens[entry.token] = OAuthTokenRecord(
-                clientId: entry.clientId,
-                scope: entry.scope,
-                expiresAt: Date(timeIntervalSince1970: entry.expiresAt),
-                sessionName: entry.sessionName,
-                lastUsedAt: entry.lastUsedAt.map { Date(timeIntervalSince1970: $0) }
-            )
-        }
-        return tokens
+
+        KeychainStore.save(account: "refresh_tokens", data: data)
+        try? FileManager.default.removeItem(at: storeUrl())
+        return decodeTokens(decoded)
     }
 
     static func save(_ tokens: [String: OAuthTokenRecord]) {
@@ -469,8 +514,7 @@ enum OAuthTokenStore {
         guard let data = try? JSONEncoder().encode(payload) else {
             return
         }
-        createDirectoryIfNeeded()
-        try? data.write(to: storeUrl(), options: [.atomic])
+        KeychainStore.save(account: "refresh_tokens", data: data)
     }
 
     private static func storeUrl() -> URL {
@@ -484,13 +528,33 @@ enum OAuthTokenStore {
         let url = storeUrl().deletingLastPathComponent()
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
     }
+
+    private static func decodeTokens(_ decoded: [PersistedToken]) -> [String: OAuthTokenRecord] {
+        var tokens: [String: OAuthTokenRecord] = [:]
+        for entry in decoded {
+            tokens[entry.token] = OAuthTokenRecord(
+                clientId: entry.clientId,
+                scope: entry.scope,
+                expiresAt: Date(timeIntervalSince1970: entry.expiresAt),
+                sessionName: entry.sessionName,
+                lastUsedAt: entry.lastUsedAt.map { Date(timeIntervalSince1970: $0) }
+            )
+        }
+        return tokens
+    }
 }
 
 enum OAuthKeyStore {
     static func loadOrCreateKey() -> SymmetricKey {
+        if let data = KeychainStore.load(account: "oauth_signing_key") {
+            return SymmetricKey(data: data)
+        }
+
         let url = keyUrl()
         if let data = try? Data(contentsOf: url),
            let keyData = Data(base64Encoded: data) {
+            KeychainStore.save(account: "oauth_signing_key", data: keyData)
+            try? FileManager.default.removeItem(at: url)
             return SymmetricKey(data: keyData)
         }
 
@@ -510,9 +574,7 @@ enum OAuthKeyStore {
         }
 
         let keyData = Data(bytes)
-        let encoded = Data(keyData.base64EncodedString().utf8)
-        createKeyDirectoryIfNeeded()
-        try? encoded.write(to: keyUrl(), options: [.atomic])
+        KeychainStore.save(account: "oauth_signing_key", data: keyData)
         return SymmetricKey(data: keyData)
     }
 
@@ -531,12 +593,18 @@ enum OAuthKeyStore {
 
 enum RevokedClientStore {
     static func load() -> Set<String> {
-        guard let data = try? Data(contentsOf: storeUrl()) else {
+        if let data = KeychainStore.load(account: "revoked_clients"),
+           let decoded = try? JSONDecoder().decode([String].self, from: data) {
+            return Set(decoded)
+        }
+
+        guard let data = try? Data(contentsOf: storeUrl()),
+              let decoded = try? JSONDecoder().decode([String].self, from: data) else {
             return []
         }
-        guard let decoded = try? JSONDecoder().decode([String].self, from: data) else {
-            return []
-        }
+
+        KeychainStore.save(account: "revoked_clients", data: data)
+        try? FileManager.default.removeItem(at: storeUrl())
         return Set(decoded)
     }
 
@@ -545,8 +613,7 @@ enum RevokedClientStore {
         guard let data = try? JSONEncoder().encode(payload) else {
             return
         }
-        createDirectoryIfNeeded()
-        try? data.write(to: storeUrl(), options: [.atomic])
+        KeychainStore.save(account: "revoked_clients", data: data)
     }
 
     private static func storeUrl() -> URL {
