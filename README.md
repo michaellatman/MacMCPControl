@@ -2,6 +2,8 @@
 
 A native macOS menubar app that hosts a local MCP (Model Context Protocol) server, allowing AI assistants to control your Mac with your permission.
 
+> **Disclaimer:** Remote control of your Mac carries inherent risks. By using this software, you accept full responsibility for actions taken with it. The author is not liable for damages, data loss, or security incidents.
+
 ## Features
 
 - **Native SwiftUI menubar app** - Runs quietly in your menu bar
@@ -112,10 +114,6 @@ The menubar shows:
 - Local MCP URL
 - Ngrok URL (when connected, with copy button)
 - Authorized session count
-
-## Disclaimer
-
-Remote control of your Mac carries inherent risks. By using this software, you accept full responsibility for actions taken with it. The author is not liable for damages, data loss, or security incidents.
 
 ## License
 
