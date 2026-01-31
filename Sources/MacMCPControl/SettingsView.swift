@@ -313,7 +313,7 @@ struct UrlRow: View {
         guard let components = URLComponents(string: url), let host = components.host else {
             return "<redacted>"
         }
-        let maskedHost = host.split(separator: ".").map { _ in "•••" }.joined(separator: ".")
+        let maskedHost = host.split(separator: ".").map { _ in "***" }.joined(separator: ".")
         var redacted = components
         redacted.host = maskedHost
         return redacted.string ?? "<redacted>"
