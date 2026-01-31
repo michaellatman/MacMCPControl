@@ -1,123 +1,74 @@
 # Mac MCP Control
 
-A native macOS menubar app that hosts a local MCP (Model Context Protocol) server, allowing AI assistants to control your Mac with your permission.
+Mac MCP Control is a macOS menubar app that turns a Mac into a local, user‑approved control server. It exposes MCP over HTTP, gates access through in‑app OAuth approval, and executes actions through native macOS APIs. It is built for real workflows: local automation, remote control via ngrok when needed, and clear session management.
 
 > **Disclaimer:** Remote control of your Mac carries inherent risks. By using this software, you accept full responsibility for actions taken with it. The author is not liable for damages, data loss, or security incidents.
 
-## Features
+## What It Does
 
-- **Native SwiftUI menubar app** - Runs quietly in your menu bar
-- **MCP server** - Exposes computer-use tools over HTTP
-- **OAuth 2.0 authentication** - Secure authorization flow for clients
-- **Session management** - View, revoke, and manage authorized sessions
-- **Optional ngrok tunnel** - Expose your Mac to the internet with a public URL (ngrok bundled)
-- **Permissions management** - Guided onboarding for Accessibility and Screen Recording permissions
-- **Auto-save settings** - Changes apply immediately
-- **Persistent sessions** - Sessions and revocations survive app restarts
-
-### Computer Use Capabilities
-
-- Mouse control (move, click, drag, scroll)
-- Keyboard input (typing, key combinations)
-- Screenshots (full screen capture)
-- Shell command execution
-- AppleScript via `osascript` (through shell commands)
+- Hosts an MCP server on your Mac (default port 7519).
+- Uses OAuth 2.0 + PKCE; approvals happen only inside the app.
+- Executes actions: mouse, keyboard, screenshots, scroll, and shell commands.
+- Manages sessions with revocation and live activity tracking.
+- Optionally tunnels public access through ngrok.
 
 ## Requirements
 
-- macOS 14.0 or later
+- macOS 14.0+
 - Xcode Command Line Tools (for building from source)
 
-## Installation
+## Install
 
 ### Releases
 
 Download the latest build from the [Releases page](https://github.com/michaellatman/MacMCPControl/releases).
 
-### Building from Source
+### Build from Source
 
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/mac-mcp-control.git
-cd mac-mcp-control
-
-# Build and create app bundle
+git clone https://github.com/michaellatman/MacMCPControl.git
+cd MacMCPControl
 ./scripts/build.sh
-
-# The app will be at ./MacMCPControl.app
 open MacMCPControl.app
 ```
 
 ## First Launch
 
-On first launch, the app guides you through:
+You will be prompted for:
+1. **Accessibility** (mouse/keyboard control)
+2. **Screen Recording** (screenshots)
+3. **Terms Acceptance**
 
-1. **Accessibility Permission** - Required for mouse/keyboard control
-   - Drag the app icon into System Settings > Privacy & Security > Accessibility
-
-2. **Screen Recording Permission** - Required for screenshots
-   - Drag the app icon into System Settings > Privacy & Security > Screen Recording
-   - Click "Reopen App" after granting permission
-
-3. **Terms Acceptance** - Acknowledge the risks of remote Mac control
-
-After completing onboarding, the MCP server starts automatically.
+After onboarding, the server starts automatically.
 
 ## Configuration
 
-Access Settings from the menubar icon (or Cmd+,):
+Settings are accessible from the menubar (Cmd+,):
 
-### Settings Tab
-- **Device Name** - Identifier for your Mac (defaults to computer name)
-- **MCP Port** - Local server port (default: 7519)
-- **Enable ngrok tunnel** - Toggle public URL access
-- **Ngrok Token** - Optional auth token for ngrok features
+- **Device Name** — label for this Mac
+- **MCP Port** — default 7519
+- **Enable ngrok tunnel** — public URL when needed
+- **Ngrok Token** — optional auth token
 
-### Sessions Tab
-- View all authorized client sessions
-- Revoke individual sessions or all sessions
-- Sessions persist across app restarts
-
-### Logs Tab
-- View real-time server logs
-- Copy logs for debugging
-- Clear log history
+Sessions tab shows active authorizations. You can rename, revoke selected, or revoke all.
 
 ## MCP Endpoints
 
-### Local Access
-```
-http://localhost:7519/mcp
-```
-
-### Public Access (with ngrok enabled)
-```
-https://<subdomain>.ngrok.app/mcp
-```
-
-### OAuth Discovery
-- `/.well-known/oauth-authorization-server`
-- `/.well-known/oauth-protected-resource`
-
-## Security
-
-- OAuth 2.0 with PKCE for secure authorization
-- Authorization approval happens in-app (browser pages cannot grant access)
-- Session revocation immediately invalidates access
-- Revoking all sessions regenerates signing keys
-- All session data persisted securely
+- Local: `http://localhost:7519/mcp`
+- Public (ngrok): `https://<subdomain>.ngrok.app/mcp`
+- Discovery:
+  - `/.well-known/oauth-authorization-server`
+  - `/.well-known/oauth-protected-resource`
 
 ## Security Model
 
-Mac MCP Control is a local-first OAuth server that only issues tokens after the user approves the request inside the macOS app. Clients can initiate OAuth via browser, but authorization is gated by an in-app modal with a confirm code. Tokens are short-lived and refresh tokens can be revoked per client or globally.
+- OAuth approvals are in‑app only; the browser cannot grant access.
+- Short‑lived access tokens, refresh tokens per client.
+- Revocation is immediate; “revoke all” rotates the signing key.
+- OAuth signing key, refresh tokens, and revoked clients are stored in macOS Keychain.
+- If you enable ngrok, treat the URL as sensitive and revoke when done.
 
-Threat model highlights:
-- Remote clients can only act after explicit user approval in the app.
-- OAuth signing key and refresh tokens are stored in macOS Keychain.
-- Session revocation immediately blocks refresh token exchange for that client.
-- Ngrok exposes the server to the internet; use only when needed and revoke sessions when done.
-
-## Architecture (High Level)
+## Architecture
 
 ```mermaid
 flowchart LR
@@ -133,27 +84,16 @@ flowchart LR
   MCP -->|actions| Mac[macOS APIs]
 ```
 
-## Token & Session Storage
-
 ```mermaid
 flowchart TB
   App[Mac MCP Control] -->|Keychain write| Keychain[(Keychain)]
   Keychain -->|oauth_signing_key| Key[Signing Key]
   Keychain -->|refresh_tokens| Refresh[Refresh Tokens]
   Keychain -->|revoked_clients| Revoked[Revoked Clients]
-  App -->|uses| MCP[MCP Server]
-  MCP -->|validate bearer| Key
+  MCP[MCP Server] -->|validate bearer| Key
   MCP -->|refresh exchange| Refresh
   MCP -->|revocation check| Revoked
 ```
-
-## Menu Bar
-
-The menubar shows:
-- Server status
-- Local MCP URL
-- Ngrok URL (when connected, with copy button)
-- Authorized session count
 
 ## License
 
