@@ -81,7 +81,7 @@ struct SettingsView: View {
         )
         .alert("Restart onboarding?", isPresented: $showRestartOnboardingAlert) {
             Button("Restart", role: .destructive) {
-                dismissWindow(id: "settings")
+                closeSettingsWindow()
                 onRestartOnboarding()
             }
             Button("Cancel", role: .cancel) {}
@@ -180,6 +180,14 @@ struct SettingsView: View {
         onSave()
         lastAppliedDeviceName = settingsManager.deviceName
         lastAppliedPort = settingsManager.mcpPort
+    }
+
+    private func closeSettingsWindow() {
+        dismissWindow(id: "settings")
+        // Fallback for cases where the SwiftUI dismiss handler doesn't close the window.
+        for window in NSApp.windows where window.title.contains("Settings") {
+            window.close()
+        }
     }
 
     private func requestServiceRestartIfNeeded() {
