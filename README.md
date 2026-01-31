@@ -113,6 +113,10 @@ The menubar shows:
 - Ngrok URL (when connected, with copy button)
 - Authorized session count
 
+## Disclaimer
+
+Remote control of your Mac carries inherent risks. By using this software, you accept full responsibility for actions taken with it. The author is not liable for damages, data loss, or security incidents.
+
 ## License
 
 See `LICENSE`.
