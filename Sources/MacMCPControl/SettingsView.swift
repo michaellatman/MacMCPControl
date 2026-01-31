@@ -221,6 +221,7 @@ struct ServerUrlsSection: View {
     let mcpPort: Int
     let ngrokUrl: String?
     let ngrokConnecting: Bool
+    @State private var showPublicUrl = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -236,7 +237,9 @@ struct ServerUrlsSection: View {
                 if let ngrokUrl = ngrokUrl {
                     UrlRow(
                         label: "Public URL",
-                        url: "\(ngrokUrl)/mcp"
+                        url: "\(ngrokUrl)/mcp",
+                        isSensitive: true,
+                        reveal: $showPublicUrl
                     )
                 } else {
                     HStack {
@@ -268,17 +271,26 @@ struct ServerUrlsSection: View {
 struct UrlRow: View {
     let label: String
     let url: String
+    var isSensitive: Bool = false
+    var reveal: Binding<Bool> = .constant(true)
 
     var body: some View {
         HStack {
             Text("\(label):")
                 .foregroundColor(.secondary)
 
-            Text(url)
+            Text(displayUrl)
                 .font(.system(.body, design: .monospaced))
                 .textSelection(.enabled)
 
             Spacer()
+
+            if isSensitive {
+                Button(reveal.wrappedValue ? "Hide" : "Reveal") {
+                    reveal.wrappedValue.toggle()
+                }
+                .buttonStyle(.bordered)
+            }
 
             Button {
                 NSPasteboard.general.clearContents()
@@ -294,6 +306,17 @@ struct UrlRow: View {
             RoundedRectangle(cornerRadius: 6)
                 .fill(Color(nsColor: .controlBackgroundColor))
         )
+    }
+
+    private var displayUrl: String {
+        guard isSensitive, !reveal.wrappedValue else { return url }
+        guard let components = URLComponents(string: url), let host = components.host else {
+            return "<redacted>"
+        }
+        let maskedHost = host.split(separator: ".").map { _ in "•••" }.joined(separator: ".")
+        var redacted = components
+        redacted.host = maskedHost
+        return redacted.string ?? "<redacted>"
     }
 }
 
