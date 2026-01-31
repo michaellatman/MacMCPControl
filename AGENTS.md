@@ -40,4 +40,3 @@ open MacMCPControl.app
   - `APPLE_CERTIFICATE_CER_BASE64`
   - `APPLE_SIGNING_IDENTITY`
 - OAuth approval is in-app; browser pages should not grant access directly.
-*** End Patch"}"}}
