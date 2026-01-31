@@ -107,6 +107,46 @@ https://<subdomain>.ngrok.app/mcp
 - Revoking all sessions regenerates signing keys
 - All session data persisted securely
 
+## Security Model
+
+Mac MCP Control is a local-first OAuth server that only issues tokens after the user approves the request inside the macOS app. Clients can initiate OAuth via browser, but authorization is gated by an in-app modal with a confirm code. Tokens are short-lived and refresh tokens can be revoked per client or globally.
+
+Threat model highlights:
+- Remote clients can only act after explicit user approval in the app.
+- OAuth signing key and refresh tokens are stored in macOS Keychain.
+- Session revocation immediately blocks refresh token exchange for that client.
+- Ngrok exposes the server to the internet; use only when needed and revoke sessions when done.
+
+## Architecture (High Level)
+
+```mermaid
+flowchart LR
+  Client[OAuth Client] -->|/oauth/authorize| MCP[MCP Server]
+  MCP -->|/oauth/approve| Browser[Approval Page]
+  Browser -->|poll /oauth/pending| MCP
+  MCP -->|pending auth| App[Mac MCP Control App]
+  App -->|approve/deny| MCP
+  MCP -->|redirect with code| Browser
+  Browser -->|/oauth/token| MCP
+  MCP -->|Bearer tokens| Client
+  Client -->|/mcp tools| MCP
+  MCP -->|actions| Mac[macOS APIs]
+```
+
+## Token & Session Storage
+
+```mermaid
+flowchart TB
+  App[Mac MCP Control] -->|Keychain write| Keychain[(Keychain)]
+  Keychain -->|oauth_signing_key| Key[Signing Key]
+  Keychain -->|refresh_tokens| Refresh[Refresh Tokens]
+  Keychain -->|revoked_clients| Revoked[Revoked Clients]
+  App -->|uses| MCP[MCP Server]
+  MCP -->|validate bearer| Key
+  MCP -->|refresh exchange| Refresh
+  MCP -->|revocation check| Revoked
+```
+
 ## Menu Bar
 
 The menubar shows:
