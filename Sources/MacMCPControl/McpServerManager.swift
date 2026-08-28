@@ -610,7 +610,8 @@ final class McpServerManager {
         let resource = "\(resourceBase)/mcp"
         let metadata: [String: Any] = [
             "resource": resource,
-            "authorization_servers": [resourceBase]
+            "authorization_servers": [resourceBase],
+            "scopes_supported": ["mcp:tools"]
         ]
         return jsonResponse(metadata)
     }
@@ -621,7 +622,9 @@ final class McpServerManager {
         let clientId = query["client_id"] ?? ""
         let redirectUri = decodeQueryValue(query["redirect_uri"] ?? "")
         let state = decodeQueryValue(query["state"] ?? "")
-        let scope = decodeQueryValue(query["scope"] ?? "mcp:tools")
+        let requestedScope = decodeQueryValue(query["scope"] ?? "")
+        // RFC 6749 section 3.1 treats empty parameters as omitted.
+        let scope = requestedScope.isEmpty ? "mcp:tools" : requestedScope
         let codeChallenge = decodeQueryValue(query["code_challenge"] ?? "")
         let codeChallengeMethod = query["code_challenge_method"]
 
@@ -629,8 +632,11 @@ final class McpServerManager {
             return jsonResponse(["error": "invalid_request", "error_description": "Missing parameters"])
         }
 
-        guard OAuthPolicy.validChallenge(codeChallenge, method: codeChallengeMethod), scope == "mcp:tools" else {
-            return jsonResponse(["error": "invalid_request", "error_description": "Use S256 PKCE and scope mcp:tools."])
+        guard OAuthPolicy.validChallenge(codeChallenge, method: codeChallengeMethod) else {
+            return jsonResponse(["error": "invalid_request", "error_description": "Use S256 PKCE with a valid code_challenge."])
+        }
+        guard scope == "mcp:tools" else {
+            return jsonResponse(["error": "invalid_scope", "error_description": "The supported scope is mcp:tools."])
         }
         guard OAuthPolicy.validRedirect(redirectUri),
               authQueue.sync(execute: { registeredClients[clientId]?.redirectUris.contains(redirectUri) == true }) else {
@@ -1013,7 +1019,7 @@ final class McpServerManager {
         let resource = "\(base)/mcp"
         let authServer = base
         let resourceMetadata = "\(authServer)/.well-known/oauth-protected-resource/mcp"
-        let headerValue = "Bearer realm=\"mac-mcp-control\", resource=\"\(resource)\", authorization_uri=\"\(authServer)/oauth/authorize\", resource_metadata=\"\(resourceMetadata)\""
+        let headerValue = "Bearer realm=\"mac-mcp-control\", resource=\"\(resource)\", authorization_uri=\"\(authServer)/oauth/authorize\", resource_metadata=\"\(resourceMetadata)\", scope=\"mcp:tools\""
         return .raw(401, "Unauthorized", ["WWW-Authenticate": headerValue], { _ in })
     }
 
