@@ -37,4 +37,7 @@ cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
   <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
 </dict></plist>
 PLIST
+# Run the packaged executable, not the SwiftPM build-tree executable. This must work
+# without reaching back into the build directory or starting the control server.
+"$APP_DIR/Contents/MacOS/$APP_NAME" --check-bundled-resources
 printf 'Built %s\n' "$APP_DIR"

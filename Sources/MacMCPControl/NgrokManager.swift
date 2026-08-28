@@ -12,7 +12,12 @@ final class NgrokManager {
     func start(port: Int, authToken: String) {
         stop()
         didRetry = false
-        ngrokExecutableUrl = resolveNgrokExecutable()
+        guard let executable = AppResources.ngrokExecutable(),
+              FileManager.default.isExecutableFile(atPath: executable.path) else {
+            LogStore.shared.log("Bundled ngrok is missing. Reinstall Mac MCP Control from the latest release.", level: .error)
+            return
+        }
+        ngrokExecutableUrl = executable
 
         cleanupExistingNgrok()
 
@@ -21,15 +26,9 @@ final class NgrokManager {
         }
 
         let process = Process()
-        if let ngrokExecutableUrl {
-            process.executableURL = ngrokExecutableUrl
-            process.arguments = ["http", "http://127.0.0.1:\(port)", "--inspect=false", "--log=stdout", "--log-format=json"]
-            LogStore.shared.log("Using bundled ngrok at \(ngrokExecutableUrl.path)")
-        } else {
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-            process.arguments = ["ngrok", "http", "http://127.0.0.1:\(port)", "--inspect=false", "--log=stdout", "--log-format=json"]
-            LogStore.shared.log("Using ngrok from PATH")
-        }
+        process.executableURL = executable
+        process.arguments = ["http", "http://127.0.0.1:\(port)", "--inspect=false", "--log=stdout", "--log-format=json"]
+        LogStore.shared.log("Using bundled ngrok at \(executable.path)")
 
         let pipe = Pipe()
         process.standardOutput = pipe
@@ -152,30 +151,18 @@ final class NgrokManager {
     }
 
     private func runNgrok(_ arguments: [String]) -> Process? {
+        guard let ngrokExecutableUrl else { return nil }
         let process = Process()
-        if let ngrokExecutableUrl {
-            process.executableURL = ngrokExecutableUrl
-            process.arguments = arguments
-        } else {
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-            process.arguments = ["ngrok"] + arguments
-        }
+        process.executableURL = ngrokExecutableUrl
+        process.arguments = arguments
         do {
             try process.run()
             process.waitUntilExit()
             return process
         } catch {
-            LogStore.shared.log("Failed to run ngrok \(arguments.joined(separator: " ")): \(error)", level: .warning)
+            LogStore.shared.log("Failed to run bundled ngrok: \(error)", level: .warning)
             return nil
         }
     }
 
-    private func resolveNgrokExecutable() -> URL? {
-        // SwiftPM resources are reliably accessed via Bundle.module.
-        if let url = Bundle.module.url(forResource: "ngrok", withExtension: nil) {
-            return url
-        }
-        // Fallback for non-SwiftPM packaging scenarios.
-        return Bundle.main.url(forResource: "ngrok", withExtension: nil)
-    }
 }
