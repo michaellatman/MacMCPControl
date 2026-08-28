@@ -81,7 +81,7 @@ struct ApprovalPromptView: View {
                     Toggle("I am at my Mac and I approve this request.", isOn: $confirmedAtMac)
                 }
 
-                Text("Only approve if you initiated this connection.")
+                Text("This client can see your screen, control your apps, and access data as your user. It can run commands through Terminal, or directly if shell access is enabled. No further approval is required for each action. Only approve a connection you started and trust.")
                     .font(.caption)
                     .foregroundColor(.secondary)
             }

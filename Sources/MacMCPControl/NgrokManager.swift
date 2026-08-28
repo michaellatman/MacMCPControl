@@ -23,11 +23,11 @@ final class NgrokManager {
         let process = Process()
         if let ngrokExecutableUrl {
             process.executableURL = ngrokExecutableUrl
-            process.arguments = ["http", String(port), "--log=stdout", "--log-format=json"]
+            process.arguments = ["http", "http://127.0.0.1:\(port)", "--inspect=false", "--log=stdout", "--log-format=json"]
             LogStore.shared.log("Using bundled ngrok at \(ngrokExecutableUrl.path)")
         } else {
             process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-            process.arguments = ["ngrok", "http", String(port), "--log=stdout", "--log-format=json"]
+            process.arguments = ["ngrok", "http", "http://127.0.0.1:\(port)", "--inspect=false", "--log=stdout", "--log-format=json"]
             LogStore.shared.log("Using ngrok from PATH")
         }
 

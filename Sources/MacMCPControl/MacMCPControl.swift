@@ -78,6 +78,7 @@ final class AppState: ObservableObject {
             ngrokUrl = nil
             ngrokManager.onUpdate = { [weak self] url in
                 Task { @MainActor in
+                    self?.mcpServerManager.setPublicBaseUrl(url)
                     self?.ngrokUrl = url
                     self?.ngrokConnecting = (url == nil && self?.settingsManager.ngrokEnabled == true)
                 }
@@ -86,6 +87,7 @@ final class AppState: ObservableObject {
         } else {
             ngrokConnecting = false
             ngrokManager.stop()
+            mcpServerManager.setPublicBaseUrl(nil)
             ngrokUrl = nil
         }
 
@@ -111,6 +113,7 @@ final class AppState: ObservableObject {
         statsTimer?.invalidate()
         statsTimer = nil
         ngrokManager.stop()
+        mcpServerManager.setPublicBaseUrl(nil)
         mcpServerManager.onAuthRequest = nil
         mcpServerManager.stop()
         status = "Stopped"
@@ -130,6 +133,7 @@ final class AppState: ObservableObject {
         settingsManager.acceptedTerms = false
         settingsManager.deviceName = Host.current().localizedName ?? "My Mac"
         settingsManager.mcpPort = 7519
+        settingsManager.shellEnabled = false
         settingsManager.ngrokEnabled = false
         settingsManager.ngrokAuthToken = ""
 
@@ -163,6 +167,8 @@ final class AppState: ObservableObject {
     }
 
     private func enqueueApprovalPrompt(_ request: PendingAuthRequestInfo) {
+        pendingApprovalQueue.removeAll { Date().timeIntervalSince($0.createdAt) > 600 }
+        guard pendingApprovalQueue.count < 16 else { return }
         pendingApprovalQueue.append(request)
         showNextApprovalPromptIfNeeded()
     }

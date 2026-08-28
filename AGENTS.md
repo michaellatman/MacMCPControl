@@ -5,7 +5,7 @@
 - App resources (icons, ngrok binary, etc.) are in `Sources/MacMCPControl/Resources/`.
 - Build artifacts and the local app bundle may appear at repo root as `MacMCPControl.app`.
 - CI workflow lives in `.github/workflows/release.yml` (build, sign, and publish releases).
-- No dedicated `Tests/` directory currently exists.
+- `Tests/MacMCPControlTests/` covers OAuth, HTTP parsing, and server behavior. `Tests/Release/` checks release script control flow.
 
 ## Build, Test, and Development Commands
 - `./scripts/build.sh` — builds a release binary and assembles/signs `MacMCPControl.app`.
@@ -25,7 +25,7 @@ open MacMCPControl.app
 - No formatter or linter is configured; keep changes minimal and consistent with nearby code.
 
 ## Testing Guidelines
-- No automated tests are currently configured.
+- Run `swift test` and `python3 -m unittest discover -s Tests/Release` before submitting changes.
 - When adding tests, place them under a new `Tests/` directory and document how to run them.
 - Prefer small, deterministic tests for security-sensitive code (OAuth, token handling).
 
@@ -40,4 +40,3 @@ open MacMCPControl.app
   - `APPLE_CERTIFICATE_CER_BASE64`
   - `APPLE_SIGNING_IDENTITY`
 - OAuth approval is in-app; browser pages should not grant access directly.
-*** End Patch"}"}}

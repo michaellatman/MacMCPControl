@@ -38,30 +38,36 @@ final class McpServerManager {
     typealias StatsUpdateHandler = @Sendable (Int, Int) -> Void
     private let settingsManager: SettingsManager
     private let actionExecutor = ActionExecutor()
-    private let oauthManager = OAuthManager()
-    private let server = HttpServer()
+    private let oauthManager: OAuthManager
+    let server = HttpServer()
     private var activeSessions: Set<String> = []
     private var sessionLastSeen: [String: Date] = [:]
     private let sessionTtl: TimeInterval = 5 * 60
     private let statsQueue = DispatchQueue(label: "mac.mcp.stats")
     private var isRunning = false
     private var pendingAuthRequests: [String: PendingAuthRequest] = [:]
-    private var registeredClients: Set<String> = []
-    private var lastExternalBaseUrl: String?
+    private var registeredClients: [String: RegisteredOAuthClient]
+    private var publicBaseUrl: String?
+    private var authRequestTimes: [Date] = []
+    private var registrationTimes: [Date] = []
     private let authQueue = DispatchQueue(label: "mac.mcp.oauth.flow")
     private let pendingAuthTtl: TimeInterval = 10 * 60
     var onStatsUpdate: StatsUpdateHandler?
     var onAuthRequest: (@Sendable (PendingAuthRequestInfo) -> Void)?
 
-    init(settingsManager: SettingsManager) {
+    init(settingsManager: SettingsManager, oauthManager: OAuthManager = OAuthManager()) {
         self.settingsManager = settingsManager
+        self.oauthManager = oauthManager
+        self.registeredClients = settingsManager.registeredOAuthClients
     }
 
-    func start() {
-        if isRunning {
-            return
-        }
-
+    func configureRoutes() {
+        server.middleware = [{ [weak self] request in
+            guard let self, self.validRequestOrigin(request) else {
+                return .raw(403, "Forbidden", [:], { _ in })
+            }
+            return nil
+        }]
         server.GET["/.well-known/oauth-authorization-server"] = { [weak self] request in
             guard let self else {
                 return .internalServerError
@@ -158,8 +164,14 @@ final class McpServerManager {
             return self.handleDelete(request)
         }
 
+    }
+
+    func start() {
+        guard !isRunning, (1...65535).contains(settingsManager.mcpPort) else { return }
+        configureRoutes()
         do {
-            try server.start(UInt16(settingsManager.mcpPort))
+            server.listenAddressIPv4 = "127.0.0.1"
+            try server.start(UInt16(settingsManager.mcpPort), forceIPv4: true)
             isRunning = true
             LogStore.shared.log("MCP server listening on http://localhost:\(settingsManager.mcpPort)/mcp")
         } catch {
@@ -218,7 +230,7 @@ final class McpServerManager {
 
         return .raw(200, "OK", headers, { writer in
             try writer.write([UInt8](":ok\n\n".utf8))
-            while true {
+            while self.isAuthorized(request) && self.isSessionActive(sessionHeader) {
                 Thread.sleep(forTimeInterval: 15.0)
                 try writer.write([UInt8](":keepalive\n\n".utf8))
             }
@@ -263,7 +275,7 @@ final class McpServerManager {
         case "tools/list":
             return handleToolsList(requestId: requestId)
         case "tools/call":
-            return handleToolsCall(requestId: requestId, params: params)
+            return handleToolsCall(requestId: requestId, params: params, request: request)
         default:
             return jsonRpcError(id: requestId, message: "Unknown method: \(method)")
         }
@@ -366,7 +378,7 @@ final class McpServerManager {
         return jsonRpcResponse(id: requestId, result: ["tools": tools])
     }
 
-    private func handleToolsCall(requestId: Any?, params: [String: Any]?) -> HttpResponse {
+    private func handleToolsCall(requestId: Any?, params: [String: Any]?, request: HttpRequest) -> HttpResponse {
         guard let params else {
             return jsonRpcError(id: requestId, message: "Missing params")
         }
@@ -379,7 +391,7 @@ final class McpServerManager {
 
         switch name {
         case "computer":
-            return handleComputerTool(requestId: requestId, arguments: arguments)
+            return handleComputerTool(requestId: requestId, arguments: arguments, request: request)
         case "local_computer_status":
             return handleStatusTool(requestId: requestId)
         default:
@@ -387,7 +399,7 @@ final class McpServerManager {
         }
     }
 
-    private func handleComputerTool(requestId: Any?, arguments: [String: Any]) -> HttpResponse {
+    private func handleComputerTool(requestId: Any?, arguments: [String: Any], request: HttpRequest) -> HttpResponse {
         guard let actions = arguments["actions"] as? [[String: Any]] else {
             return jsonRpcError(id: requestId, message: "Missing actions")
         }
@@ -397,13 +409,22 @@ final class McpServerManager {
         var cursorPosition: [String: Any]? = nil
         var shellOutput: [String: Any]? = nil
 
+        guard actions.count <= 100 else {
+            return jsonRpcToolError(id: requestId, message: "Send no more than 100 actions at a time.")
+        }
         for (index, action) in actions.enumerated() {
+            guard isAuthorized(request) else {
+                return unauthorizedResponse(request, reason: "authorization revoked or expired during action batch")
+            }
             let actionType = (action["action"] as? String) ?? (action["type"] as? String)
             guard let actionType else {
                 let keys = action.keys.sorted().joined(separator: ", ")
                 return jsonRpcError(id: requestId, message: "Action #\(index) missing action type. Keys: \(keys)")
             }
 
+            if actionType == "shell" && !settingsManager.shellEnabled {
+                return jsonRpcToolError(id: requestId, message: "Shell access is disabled. Enable it in Mac MCP Control settings on your Mac.")
+            }
             do {
                 let result = try actionExecutor.execute(actionType: actionType, params: action)
                 actionsExecuted += 1
@@ -524,13 +545,24 @@ final class McpServerManager {
     }
 
     func revokeAuthorizedSession(_ token: String) {
-        oauthManager.revokeRefreshToken(token)
-        emitStatsUpdate()
+        authQueue.sync {
+            let clientId = oauthManager.listRefreshTokens().first { $0.token == token }?.clientId
+            pendingAuthRequests = pendingAuthRequests.filter { $0.value.clientId != clientId }
+            oauthManager.revokeRefreshToken(token)
+        }
+        statsQueue.async { [weak self] in self?.emitStatsUpdate() }
     }
 
     func revokeAllAuthorizedSessions() {
-        oauthManager.revokeAllRefreshTokens()
-        emitStatsUpdate()
+        authQueue.sync {
+            pendingAuthRequests.removeAll()
+            oauthManager.revokeAllRefreshTokens()
+        }
+        statsQueue.async { [weak self] in
+            self?.activeSessions.removeAll()
+            self?.sessionLastSeen.removeAll()
+            self?.emitStatsUpdate()
+        }
     }
 
     private func emitStatsUpdate() {
@@ -555,8 +587,7 @@ final class McpServerManager {
     }
 
     private func handleAuthServerMetadata(_ request: HttpRequest) -> HttpResponse {
-        // Use the request base URL (supports ngrok via X-Forwarded-* headers) so remote clients don't
-        // get directed to localhost on their own machine.
+        // Use the known tunnel URL for remote clients, never a URL supplied by forwarded headers.
         let issuer = baseUrl(for: request)
         let metadata: [String: Any] = [
             "issuer": issuer,
@@ -565,10 +596,10 @@ final class McpServerManager {
             "registration_endpoint": "\(issuer)/oauth/register",
             "introspection_endpoint": "\(issuer)/oauth/introspect",
             "response_types_supported": ["code"],
-            "grant_types_supported": ["authorization_code"],
+            "grant_types_supported": ["authorization_code", "refresh_token"],
             "token_endpoint_auth_methods_supported": ["none"],
             "scopes_supported": ["mcp:tools"],
-            "code_challenge_methods_supported": ["plain", "S256"]
+            "code_challenge_methods_supported": ["S256"]
         ]
 
         return jsonResponse(metadata)
@@ -598,9 +629,11 @@ final class McpServerManager {
             return jsonResponse(["error": "invalid_request", "error_description": "Missing parameters"])
         }
 
-        // We intentionally allow any redirect URI, but we surface it in the approval UI so the user can
-        // validate they're approving the right callback destination.
-        guard isValidRedirectUri(redirectUri) else {
+        guard OAuthPolicy.validChallenge(codeChallenge, method: codeChallengeMethod), scope == "mcp:tools" else {
+            return jsonResponse(["error": "invalid_request", "error_description": "Use S256 PKCE and scope mcp:tools."])
+        }
+        guard OAuthPolicy.validRedirect(redirectUri),
+              authQueue.sync(execute: { registeredClients[clientId]?.redirectUris.contains(redirectUri) == true }) else {
             LogStore.shared.log("OAuth authorize error: invalid redirect_uri=\(redirectUri)", level: .warning)
             return jsonResponse(["error": "invalid_request", "error_description": "invalid redirect_uri"])
         }
@@ -611,8 +644,11 @@ final class McpServerManager {
         // For UX only; don't trust forwarded headers here.
         let source = request.address ?? (headerValue(request, name: "host") ?? "unknown")
         let now = Date()
-        authQueue.sync {
+        let accepted = authQueue.sync { () -> Bool in
             prunePendingAuthRequestsLocked(now: now)
+            authRequestTimes = authRequestTimes.filter { now.timeIntervalSince($0) < 60 }
+            guard pendingAuthRequests.count < 16, authRequestTimes.count < 10 else { return false }
+            authRequestTimes.append(now)
             pendingAuthRequests[requestId] = PendingAuthRequest(
                 id: requestId,
                 clientId: clientId,
@@ -628,7 +664,9 @@ final class McpServerManager {
                 createdAt: now,
                 decision: .pending
             )
+            return true
         }
+        guard accepted else { return .raw(429, "Too Many Requests", ["Retry-After": "60"], { _ in }) }
 
         let info = PendingAuthRequestInfo(
             id: requestId,
@@ -710,7 +748,7 @@ final class McpServerManager {
         </html>
         """
 
-        return .raw(200, "OK", ["Content-Type": "text/html"], { writer in
+        return .raw(200, "OK", ["Content-Type": "text/html", "Cache-Control": "no-store", "Referrer-Policy": "no-referrer", "X-Frame-Options": "DENY", "Content-Security-Policy": "frame-ancestors 'none'; base-uri 'none'"], { writer in
             try writer.write(html.data(using: .utf8) ?? Data())
         })
     }
@@ -786,39 +824,24 @@ final class McpServerManager {
     }
 
     func resolveAuthRequest(requestId: String, approve: Bool, sessionName: String?) {
-        let pending: PendingAuthRequest? = authQueue.sync {
-            pendingAuthRequests[requestId]
-        }
-        guard let pending else { return }
-
-        if Date().timeIntervalSince(pending.createdAt) > pendingAuthTtl {
-            authQueue.sync { () -> Void in
+        // Approval and revocation share this queue; an old dialog cannot create a grant after revoke-all.
+        authQueue.sync {
+            guard var pending = pendingAuthRequests[requestId], pending.decision == .pending else { return }
+            guard Date().timeIntervalSince(pending.createdAt) <= pendingAuthTtl else {
                 pendingAuthRequests.removeValue(forKey: requestId)
+                return
             }
-            return
-        }
-
-        if approve {
-            let code = oauthManager.issueAuthorizationCode(
-                clientId: pending.clientId,
-                redirectUri: pending.redirectUri,
-                scope: pending.scope,
-                sessionName: sessionName,
-                codeChallenge: pending.codeChallenge,
+            if approve, let code = oauthManager.issueAuthorizationCode(
+                clientId: pending.clientId, redirectUri: pending.redirectUri, scope: pending.scope,
+                sessionName: sessionName, codeChallenge: pending.codeChallenge,
                 codeChallengeMethod: pending.codeChallengeMethod
-            )
-            authQueue.sync {
-                guard var current = pendingAuthRequests[requestId], current.decision == .pending else { return }
-                current.decision = .approved(code: code)
-                current.sessionName = sessionName
-                pendingAuthRequests[requestId] = current
+            ) {
+                pending.decision = .approved(code: code)
+                pending.sessionName = sessionName
+            } else {
+                pending.decision = .denied
             }
-        } else {
-            authQueue.sync {
-                guard var current = pendingAuthRequests[requestId], current.decision == .pending else { return }
-                current.decision = .denied
-                pendingAuthRequests[requestId] = current
-            }
+            pendingAuthRequests[requestId] = pending
         }
     }
 
@@ -831,7 +854,7 @@ final class McpServerManager {
 
     func renameAuthorizedSession(_ token: String, sessionName: String?) {
         oauthManager.renameRefreshToken(token, sessionName: sessionName)
-        emitStatsUpdate()
+        statsQueue.async { [weak self] in self?.emitStatsUpdate() }
     }
 
     private func handleToken(_ request: HttpRequest) -> HttpResponse {
@@ -858,11 +881,6 @@ final class McpServerManager {
             return jsonResponse(["error": "invalid_request", "error_description": "Missing parameters"])
         }
 
-        if !registeredClients.contains(clientId) {
-            LogStore.shared.log("OAuth token: unknown client_id \(clientId), allowing and registering dynamically")
-            registeredClients.insert(clientId)
-        }
-
         if grantType == "authorization_code" {
             guard let result = oauthManager.exchangeCode(
                 code: code,
@@ -883,7 +901,7 @@ final class McpServerManager {
                 "scope": result.scope
             ]
             LogStore.shared.log("Issued OAuth token for client=\(clientId) scope=\"\(result.scope)\" keys=\(response.keys.sorted())")
-            emitStatsUpdate()
+            statsQueue.async { [weak self] in self?.emitStatsUpdate() }
             return jsonResponse(response)
         }
 
@@ -906,7 +924,7 @@ final class McpServerManager {
                 "scope": result.scope
             ]
             LogStore.shared.log("Issued OAuth refresh token for client=\(clientId) scope=\"\(result.scope)\" keys=\(response.keys.sorted())")
-            emitStatsUpdate()
+            statsQueue.async { [weak self] in self?.emitStatsUpdate() }
             return jsonResponse(response)
         }
 
@@ -920,14 +938,36 @@ final class McpServerManager {
         }
 
         let clientId = "client_\(UUID().uuidString)"
-        registeredClients.insert(clientId)
+        guard let redirects = json["redirect_uris"] as? [String], !redirects.isEmpty,
+              redirects.count <= 10, redirects.allSatisfy(OAuthPolicy.validRedirect) else {
+            return jsonResponse(["error": "invalid_redirect_uri"])
+        }
+        let registered = authQueue.sync { () -> Bool in
+            let now = Date()
+            registrationTimes = registrationTimes.filter { now.timeIntervalSince($0) < 60 }
+            guard registrationTimes.count < 10 else { return false }
+            prunePendingAuthRequestsLocked(now: now)
+            if registeredClients.count >= 256 {
+                // Recycle unused registrations instead of letting unauthenticated callers fill storage forever.
+                let inUse = Set(oauthManager.listRefreshTokens().map(\.clientId))
+                    .union(pendingAuthRequests.values.map(\.clientId))
+                guard let oldest = registeredClients.filter({ !inUse.contains($0.key) })
+                    .min(by: { $0.value.createdAt < $1.value.createdAt }) else { return false }
+                registeredClients.removeValue(forKey: oldest.key)
+            }
+            registrationTimes.append(now)
+            registeredClients[clientId] = RegisteredOAuthClient(redirectUris: redirects, createdAt: now)
+            settingsManager.registeredOAuthClients = registeredClients
+            return true
+        }
+        guard registered else { return .raw(429, "Too Many Requests", ["Retry-After": "60"], { _ in }) }
 
         let response: [String: Any] = [
             "client_id": clientId,
             "token_endpoint_auth_method": "none",
-            "redirect_uris": json["redirect_uris"] ?? [],
-            "grant_types": json["grant_types"] ?? ["authorization_code"],
-            "response_types": json["response_types"] ?? ["code"]
+            "redirect_uris": redirects,
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"]
         ]
 
         return jsonResponse(response)
@@ -1006,10 +1046,10 @@ final class McpServerManager {
 
         var result: [String: String] = [:]
         for pair in data.split(separator: "&") {
-            let parts = pair.split(separator: "=", maxSplits: 1)
+            let parts = pair.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
             if parts.count == 2 {
-                let key = String(parts[0]).removingPercentEncoding ?? ""
-                let value = String(parts[1]).removingPercentEncoding ?? ""
+                let key = String(parts[0]).replacingOccurrences(of: "+", with: " ").removingPercentEncoding ?? ""
+                let value = String(parts[1]).replacingOccurrences(of: "+", with: " ").removingPercentEncoding ?? ""
                 result[key] = value
             }
         }
@@ -1025,49 +1065,35 @@ final class McpServerManager {
         return result
     }
 
+    func setPublicBaseUrl(_ value: String?) {
+        authQueue.sync {
+            guard let value, let url = URLComponents(string: value), url.scheme == "https",
+                  url.host != nil, url.user == nil, url.password == nil, url.query == nil,
+                  url.fragment == nil, url.path.isEmpty else { publicBaseUrl = nil; return }
+            publicBaseUrl = value
+        }
+    }
+
     private func baseUrl(for request: HttpRequest) -> String {
-        let hostHeader = headerValue(request, name: "x-forwarded-host") ?? headerValue(request, name: "host")
-        let scheme = headerValue(request, name: "x-forwarded-proto") ?? "http"
-        if let hostHeader, !hostHeader.isEmpty {
-            let url = "\(scheme)://\(hostHeader)"
-            if !isLocalHostHeader(hostHeader) {
-                lastExternalBaseUrl = url
-            }
-            return url
+        let publicUrl = authQueue.sync { publicBaseUrl }
+        if let publicUrl, let url = URLComponents(string: publicUrl),
+           headerValue(request, name: "host")?.lowercased() == url.host?.lowercased() {
+            return publicUrl
         }
         return "http://localhost:\(settingsManager.mcpPort)"
     }
 
-    private func localBaseUrl() -> String {
-        return "http://localhost:\(settingsManager.mcpPort)"
-    }
-
-    private func isLocalHostHeader(_ hostHeader: String) -> Bool {
-        let host = hostHeader.split(separator: ":").first.map(String.init) ?? hostHeader
-        return host == "localhost" || host == "127.0.0.1" || host == "::1"
-    }
-
-    private func isLocalRequest(_ request: HttpRequest) -> Bool {
-        // Never trust Host/X-Forwarded-* here; require an actual loopback socket peer.
-        guard let address = request.address else {
-            return false
-        }
-        return isLoopbackPeerAddress(address)
-    }
-
-    private func isLoopbackPeerAddress(_ address: String) -> Bool {
-        // Swifter formats this as "<ip>:<port>" (e.g. "127.0.0.1:12345").
-        let host = address.split(separator: ":").first.map(String.init) ?? address
-        return host == "127.0.0.1" || host == "::1" || host == "localhost"
-    }
-
-    private func isValidRedirectUri(_ redirectUri: String) -> Bool {
-        guard let url = URL(string: redirectUri) else {
-            return false
-        }
-        // Require a scheme so the user sees an unambiguous destination.
-        guard let scheme = url.scheme, !scheme.isEmpty else {
-            return false
+    private func validRequestOrigin(_ request: HttpRequest) -> Bool {
+        let port = settingsManager.mcpPort
+        let localHosts = ["localhost:\(port)", "127.0.0.1:\(port)"]
+        guard let host = headerValue(request, name: "host")?.lowercased() else { return false }
+        let publicUrl = authQueue.sync { publicBaseUrl }
+        let isPublic = publicUrl.flatMap { URLComponents(string: $0)?.host?.lowercased() } == host
+        guard localHosts.contains(host) || isPublic else { return false }
+        if isPublic, headerValue(request, name: "x-forwarded-proto") != "https" { return false }
+        if let origin = headerValue(request, name: "origin") {
+            let expected = isPublic ? publicUrl : "http://\(host)"
+            guard origin == expected else { return false }
         }
         return true
     }
@@ -1087,17 +1113,10 @@ final class McpServerManager {
     }
 
     private func logRequest(_ request: HttpRequest) {
-        let query = request.queryParams.map { "\($0.0)=\($0.1)" }.joined(separator: "&")
-        let pathWithQuery = query.isEmpty ? request.path : "\(request.path)?\(query)"
-        var headers = request.headers
-        for key in headers.keys {
-            if key.lowercased() == "authorization" {
-                headers[key] = "[redacted]"
-            }
-        }
+
         let bodySize = request.body.count
         let address = request.address ?? "unknown"
-        LogStore.shared.log("HTTP \(request.method) \(pathWithQuery) from \(address) headers=\(headers) bodyBytes=\(bodySize)")
+        LogStore.shared.log("HTTP \(request.method) \(request.path) from \(address) bodyBytes=\(bodySize)")
     }
 
     private func jsonRpcResponse(id: Any?, result: [String: Any], headers: [String: String] = [:]) -> HttpResponse {
@@ -1146,7 +1165,7 @@ final class McpServerManager {
             return .internalServerError
         }
 
-        var responseHeaders = ["Content-Type": "application/json"]
+        var responseHeaders = ["Content-Type": "application/json", "Cache-Control": "no-store", "Pragma": "no-cache", "X-Content-Type-Options": "nosniff"]
         for (key, value) in headers {
             responseHeaders[key] = value
         }
