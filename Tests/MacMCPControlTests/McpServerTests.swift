@@ -67,6 +67,34 @@ final class McpServerTests: XCTestCase {
         XCTAssertNotNil(try json(request("POST", "/oauth/register", body: "{\"redirect_uris\":[\"javascript:alert(1)\"]}"))["error"])
     }
 
+    func testResourceScopeDiscoveryAndAuthorization() throws {
+        let client = try register()
+        for path in ["/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp"] {
+            let metadata = try json(request("GET", path))
+            let scopes = try XCTUnwrap(metadata["scopes_supported"] as? [String])
+            var query = authorizeQuery(client)
+            query["scope"] = scopes.joined(separator: " ")
+            XCTAssertEqual(request("GET", "/oauth/authorize", query: query).statusCode, 302)
+        }
+        let challenge = request("POST", "/mcp", body: "{\"id\":1,\"method\":\"initialize\"}").headers()["WWW-Authenticate"]
+        XCTAssertTrue(challenge?.contains("scope=\"mcp:tools\"") == true)
+    }
+
+    func testEmptyScopeStillRequiresPKCEAndRejectsUnknownScopes() throws {
+        var query = authorizeQuery(try register())
+        query["scope"] = ""
+        for method in [nil, "", "plain"] as [String?] {
+            query["code_challenge_method"] = method
+            let error = try json(request("GET", "/oauth/authorize", query: query))
+            XCTAssertEqual(error["error_description"] as? String, "Use S256 PKCE with a valid code_challenge.")
+        }
+        query["code_challenge_method"] = "S256"
+        for scope in ["read-only", "mcp:tools other", " "] {
+            query["scope"] = scope
+            XCTAssertEqual(try json(request("GET", "/oauth/authorize", query: query))["error"] as? String, "invalid_scope")
+        }
+    }
+
     func testRevocationCancelsPendingApprovalDialog() throws {
         let result = request("GET", "/oauth/authorize", query: authorizeQuery(try register()))
         let location = try XCTUnwrap(result.headers()["Location"])
@@ -158,6 +186,8 @@ final class McpServerTests: XCTestCase {
         let client = try XCTUnwrap(registered["client_id"] as? String)
         var authorize = URLComponents(string: base + "/oauth/authorize")!
         authorize.queryItems = authorizeQuery(client).map { URLQueryItem(name: $0.key, value: $0.value) }
+        // Tasklet sends scope= when its cached registration has no discovered resource scopes.
+        authorize.queryItems?.append(URLQueryItem(name: "scope", value: ""))
         // URLSession follows the production redirect to the in-app-approval waiting page.
         let (pageData, approvalResponse) = try await URLSession.shared.data(from: authorize.url!)
         let id = try XCTUnwrap(URLComponents(url: approvalResponse.url!, resolvingAgainstBaseURL: false)?.queryItems?.first?.value)
@@ -174,6 +204,7 @@ final class McpServerTests: XCTestCase {
         tokenRequest.httpBody = Data("grant_type=authorization_code&client_id=\(client)&redirect_uri=https%3A%2F%2Fexample.com%2Fcallback&code=\(code)&code_verifier=\(testVerifier)".utf8)
         let (tokenData, _) = try await URLSession.shared.data(for: tokenRequest)
         let tokens = try XCTUnwrap(JSONSerialization.jsonObject(with: tokenData) as? [String: Any])
+        XCTAssertEqual(tokens["scope"] as? String, "mcp:tools")
         let token = try XCTUnwrap(tokens["access_token"] as? String)
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         let (_, authorizedResponse) = try await URLSession.shared.data(for: request)

@@ -107,6 +107,8 @@ The server listens only on `127.0.0.1`. Enable ngrok for remote access; direct L
 
 Clients must register their exact callback URLs through `/oauth/register` before authorization. Supported callbacks are HTTPS, loopback HTTP, and app-specific reverse-DNS native schemes. Fragments and embedded credentials are rejected. Authorization requires S256 PKCE and the `mcp:tools` scope. Arbitrary client IDs, plain PKCE, and unregistered callbacks are not supported.
 
+The MCP resource metadata and unauthenticated response advertise `mcp:tools`. A missing or empty authorization scope defaults to `mcp:tools`; other scopes are rejected. This also supports clients with a cached registration from before scope discovery was available. In-app approval is still required.
+
 Each access token is bound to a live approval. Revoking a client invalidates its tokens and unredeemed codes. Reauthorizing does not revive its old tokens. Revoke all also cancels pending approvals. Revocation stops future requests and remaining actions in a batch; it cannot undo an action or stop a shell process that already started.
 
 Shell commands are off by default. Enable “Allow shell commands” in Settings only when needed. This setting is not a sandbox: computer control can still open Terminal, operate signed-in apps, and access your data. Only approve clients you trust with your account. The app does not ask for approval for each action.
