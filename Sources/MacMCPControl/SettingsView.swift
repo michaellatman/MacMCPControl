@@ -16,6 +16,7 @@ struct SettingsView: View {
 
     @State private var deviceName: String = ""
     @State private var mcpPort: String = ""
+    @State private var shellEnabled = false
     @State private var ngrokEnabled: Bool = false
     @State private var ngrokToken: String = ""
     @State private var showRestartOnboardingAlert = false
@@ -70,6 +71,10 @@ struct SettingsView: View {
             // Apply immediately so the public URL state stays in sync.
             applyServiceRestartNow()
         }
+        .onChange(of: shellEnabled) { _ in
+            guard didLoadSettings else { return }
+            settingsManager.shellEnabled = shellEnabled
+        }
         .onChange(of: ngrokToken) { _ in saveSettings() }
         .background(
             Button("") {
@@ -104,6 +109,10 @@ struct SettingsView: View {
                     Divider()
 
                     PermissionsStatusSection()
+                    Toggle("Allow shell commands", isOn: $shellEnabled)
+                    Text("Approved clients can run commands as your user. Computer control can still open Terminal when this is off. Only approve clients you trust with your account.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
 
                     Divider()
 
@@ -138,6 +147,8 @@ struct SettingsView: View {
         deviceName = Host.current().localizedName ?? "My Mac"
         mcpPort = "7519"
         ngrokEnabled = false
+        shellEnabled = false
+        settingsManager.shellEnabled = false
         ngrokToken = ""
         saveSettings()
         applyServiceRestartNow()
@@ -152,6 +163,7 @@ struct SettingsView: View {
     }
 
     private func loadSettings() {
+        shellEnabled = settingsManager.shellEnabled
         deviceName = settingsManager.deviceName
         mcpPort = String(settingsManager.mcpPort)
         ngrokEnabled = settingsManager.ngrokEnabled
@@ -167,7 +179,7 @@ struct SettingsView: View {
         if !deviceName.isEmpty {
             settingsManager.deviceName = deviceName
         }
-        if let port = Int(mcpPort), port > 0 {
+        if let port = Int(mcpPort), (1...65535).contains(port) {
             settingsManager.mcpPort = port
         }
         settingsManager.ngrokEnabled = ngrokEnabled

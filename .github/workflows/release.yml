@@ -21,6 +21,21 @@ jobs:
         with:
           xcode-version: latest-stable
 
+      - name: Check notarization credentials
+        env:
+          APP_STORE_CONNECT_API_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_API_KEY_BASE64 }}
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+        run: |
+          : "${APP_STORE_CONNECT_API_KEY_BASE64:?Missing notarization API key}"
+          : "${APP_STORE_CONNECT_KEY_ID:?Missing notarization key ID}"
+          : "${APP_STORE_CONNECT_ISSUER_ID:?Missing notarization issuer ID}"
+
+      - name: Test
+        run: |
+          swift test
+          python3 -m unittest discover -s Tests/Release
+
       - name: Import Code Signing Certificate
         env:
           APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
@@ -41,21 +56,14 @@ jobs:
             KEY_PATH=$RUNNER_TEMP/certificate.key
             CER_PATH=$RUNNER_TEMP/certificate.cer
 
-            echo "APPLE_CERTIFICATE_KEY_BASE64 length: ${#APPLE_CERTIFICATE_KEY_BASE64} bytes"
-            echo "APPLE_CERTIFICATE_CER_BASE64 length: ${#APPLE_CERTIFICATE_CER_BASE64} bytes"
             echo "$APPLE_CERTIFICATE_KEY_BASE64" | base64 --decode > "$KEY_PATH"
             echo "$APPLE_CERTIFICATE_CER_BASE64" | base64 --decode > "$CER_PATH"
-            echo "Decoded key size: $(wc -c < "$KEY_PATH") bytes"
-            echo "Decoded cert size: $(wc -c < "$CER_PATH") bytes"
 
             security import "$KEY_PATH" -A -k "$KEYCHAIN_PATH"
             security import "$CER_PATH" -A -t cert -k "$KEYCHAIN_PATH"
           else
             CERTIFICATE_PATH=$RUNNER_TEMP/certificate.p12
-            echo "APPLE_CERTIFICATE_BASE64 length: ${#APPLE_CERTIFICATE_BASE64} bytes"
-            echo "APPLE_CERTIFICATE_PASSWORD length: ${#APPLE_CERTIFICATE_PASSWORD} chars"
             echo "$APPLE_CERTIFICATE_BASE64" | base64 --decode > "$CERTIFICATE_PATH"
-            echo "Decoded certificate size: $(wc -c < "$CERTIFICATE_PATH") bytes"
 
             security import "$CERTIFICATE_PATH" \
               -P "$APPLE_CERTIFICATE_PASSWORD" \
@@ -70,68 +78,16 @@ jobs:
           # Allow codesign to access the keychain
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
-      - name: Build Release
-        run: swift build -c release
+      - name: Build app bundle
+        run: bash scripts/build-app.sh
 
-      - name: Create App Bundle
-        run: |
-          APP_PATH="MacMCPControl.app"
-
-          rm -rf "$APP_PATH"
-          mkdir -p "$APP_PATH/Contents/MacOS"
-          mkdir -p "$APP_PATH/Contents/Resources"
-
-          # Copy the executable
-          cp .build/release/MacMCPControl "$APP_PATH/Contents/MacOS/"
-
-          # Copy resources
-          cp -R .build/release/MacMCPControl_MacMCPControl.bundle "$APP_PATH/Contents/Resources/"
-          cp .build/release/MacMCPControl_MacMCPControl.bundle/AppIcon.icns "$APP_PATH/Contents/Resources/"
-
-          # Create Info.plist
-          cat > "$APP_PATH/Contents/Info.plist" << 'EOF'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-              <key>CFBundleExecutable</key>
-              <string>MacMCPControl</string>
-              <key>CFBundleIdentifier</key>
-              <string>com.macmcpcontrol.app</string>
-              <key>CFBundleName</key>
-              <string>Mac MCP Control</string>
-              <key>CFBundleDisplayName</key>
-              <string>Mac MCP Control</string>
-              <key>CFBundleVersion</key>
-              <string>1.0</string>
-              <key>CFBundleShortVersionString</key>
-              <string>1.0</string>
-              <key>CFBundlePackageType</key>
-              <string>APPL</string>
-              <key>CFBundleIconFile</key>
-              <string>AppIcon</string>
-              <key>LSMinimumSystemVersion</key>
-              <string>14.0</string>
-              <key>LSUIElement</key>
-              <true/>
-              <key>NSHighResolutionCapable</key>
-              <true/>
-              <key>NSSupportsAutomaticGraphicsSwitching</key>
-              <true/>
-          </dict>
-          </plist>
-          EOF
-
-      - name: Code Sign App
+      - name: Sign, notarize, and verify release archives
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-        run: |
-          codesign --force --deep --sign "$APPLE_SIGNING_IDENTITY" MacMCPControl.app
-
-      - name: Create Release Archive
-        run: |
-          zip -r MacMCPControl.zip MacMCPControl.app
-          tar -czf MacMCPControl.app.tar.gz MacMCPControl.app
+          APP_STORE_CONNECT_API_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_API_KEY_BASE64 }}
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+        run: bash scripts/notarize.sh
 
       - name: Get Version
         id: version

@@ -4,3 +4,7 @@
 *.xcworkspace/
 *.app/
 .DS_Store
+
+__pycache__/
+MacMCPControl.zip
+MacMCPControl.app.tar.gz

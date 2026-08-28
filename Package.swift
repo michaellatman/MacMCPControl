@@ -9,7 +9,7 @@ let package = Package(
         .macOS(.v14)
     ],
     dependencies: [
-        .package(url: "https://github.com/httpswift/swifter.git", from: "1.5.0")
+        .package(path: "Vendor/Swifter")
     ],
     targets: [
         .executableTarget(
@@ -26,5 +26,6 @@ let package = Package(
                 .process("Resources/MenuBarIcon.png")
             ]
         ),
+        .testTarget(name: "MacMCPControlTests", dependencies: ["MacMCPControl", .product(name: "Swifter", package: "Swifter")]),
     ]
 )

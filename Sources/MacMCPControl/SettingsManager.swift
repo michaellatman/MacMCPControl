@@ -1,7 +1,22 @@
 import Foundation
 
 class SettingsManager {
-    private let defaults = UserDefaults.standard
+    private let defaults: UserDefaults
+
+    init(defaults: UserDefaults = .standard) { self.defaults = defaults }
+
+    var registeredOAuthClients: [String: RegisteredOAuthClient] {
+        get {
+            guard let data = defaults.data(forKey: "registeredOAuthClients") else { return [:] }
+            return (try? JSONDecoder().decode([String: RegisteredOAuthClient].self, from: data)) ?? [:]
+        }
+        set { defaults.set(try? JSONEncoder().encode(newValue), forKey: "registeredOAuthClients") }
+    }
+
+    var shellEnabled: Bool {
+        get { defaults.bool(forKey: "shellEnabled") }
+        set { defaults.set(newValue, forKey: "shellEnabled") }
+    }
 
     private enum Keys {
         static let deviceName = "deviceName"
