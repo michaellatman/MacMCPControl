@@ -213,6 +213,16 @@ struct MacMCPControlApp: App {
     @StateObject private var appState: AppState
 
     init() {
+        if CommandLine.arguments.contains("--check-bundled-resources") {
+            guard let ngrok = AppResources.ngrokExecutable(),
+                  FileManager.default.isExecutableFile(atPath: ngrok.path),
+                  ngrok.resolvingSymlinksInPath().path.hasPrefix(Bundle.main.bundleURL.resolvingSymlinksInPath().path + "/") else {
+                FileHandle.standardError.write(Data("Bundled ngrok is missing or not executable.\n".utf8))
+                exit(1)
+            }
+            print("Bundled ngrok found: \(ngrok.path)")
+            exit(0)
+        }
         let state = AppState()
         _appState = StateObject(wrappedValue: state)
         appDelegate.appState = state
