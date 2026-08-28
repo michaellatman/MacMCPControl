@@ -29,9 +29,16 @@ final class HTTPTests: XCTestCase {
     }
 
     func testBoundsHeadersAndRequestLine() {
-        for text in ["GET /" + String(repeating: "x", count: 8192) + " HTTP/1.1\r\n\r\n",
-                     "GET / HTTP/1.1\r\n" + (0..<101).map { "X-\($0): a\r\n" }.joined() + "\r\n",
-                     "GET / HTTP/1.1\r\n" + (0..<5).map { "X-\($0): " + String(repeating: "x", count: 8000) + "\r\n" }.joined() + "\r\n"] {
+        let longPath = String(repeating: "x", count: 8192)
+        let manyHeaders = (0..<101).map { "X-\($0): a\r\n" }.joined()
+        let longValue = String(repeating: "x", count: 8000)
+        let largeHeaders = (0..<5).map { "X-\($0): \(longValue)\r\n" }.joined()
+        let requests = [
+            "GET /\(longPath) HTTP/1.1\r\n\r\n",
+            "GET / HTTP/1.1\r\n\(manyHeaders)\r\n",
+            "GET / HTTP/1.1\r\n\(largeHeaders)\r\n"
+        ]
+        for text in requests {
             XCTAssertThrowsError(try HttpParser().readHttpRequest(Input(text)))
         }
     }
