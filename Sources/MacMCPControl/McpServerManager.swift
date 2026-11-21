@@ -121,7 +121,12 @@ final class McpServerManager {
                 return .internalServerError
             }
             self.logRequest(request)
-            return self.handleToken(request)
+            do {
+                return try self.handleToken(request)
+            } catch {
+                LogStore.shared.log("OAuth token storage failed: \(error.localizedDescription)", level: .error)
+                return self.jsonResponse(["error": "temporarily_unavailable"], headers: ["Cache-Control": "no-store"], status: 503)
+            }
         }
 
         server.POST["/oauth/register"] = { [weak self] request in
@@ -166,17 +171,17 @@ final class McpServerManager {
 
     }
 
-    func start() {
-        guard !isRunning, (1...65535).contains(settingsManager.mcpPort) else { return }
-        configureRoutes()
-        do {
-            server.listenAddressIPv4 = "127.0.0.1"
-            try server.start(UInt16(settingsManager.mcpPort), forceIPv4: true)
-            isRunning = true
-            LogStore.shared.log("MCP server listening on http://localhost:\(settingsManager.mcpPort)/mcp")
-        } catch {
-            LogStore.shared.log("Failed to start MCP server: \(error)", level: .error)
+    func start() throws {
+        guard !isRunning else { return }
+        guard let port = UInt16(exactly: settingsManager.mcpPort), port > 0 else {
+            throw CocoaError(.validationNumberTooLarge)
         }
+        try oauthManager.prepare()
+        configureRoutes()
+        server.listenAddressIPv4 = "127.0.0.1"
+        try server.start(port, forceIPv4: true)
+        isRunning = true
+        LogStore.shared.log("MCP server listening on http://localhost:\(port)/mcp")
     }
 
     func stop() {
@@ -186,10 +191,6 @@ final class McpServerManager {
         }
     }
 
-    func restart() {
-        stop()
-        start()
-    }
 
     private func handleDelete(_ request: HttpRequest) -> HttpResponse {
         guard isAuthorized(request) else {
@@ -540,23 +541,23 @@ final class McpServerManager {
         }
     }
 
-    func listAuthorizedSessions() -> [OAuthRefreshTokenInfo] {
-        return oauthManager.listRefreshTokens()
+    func listAuthorizedSessions() -> [OAuthGrant] {
+        return oauthManager.listSessions()
     }
 
-    func revokeAuthorizedSession(_ token: String) {
-        authQueue.sync {
-            let clientId = oauthManager.listRefreshTokens().first { $0.token == token }?.clientId
+    func revokeAuthorizedSession(_ id: String) throws {
+        try authQueue.sync {
+            let clientId = oauthManager.listSessions().first { $0.id == id }?.clientId
             pendingAuthRequests = pendingAuthRequests.filter { $0.value.clientId != clientId }
-            oauthManager.revokeRefreshToken(token)
+            try oauthManager.revokeSession(id)
         }
         statsQueue.async { [weak self] in self?.emitStatsUpdate() }
     }
 
-    func revokeAllAuthorizedSessions() {
-        authQueue.sync {
+    func revokeAllAuthorizedSessions() throws {
+        try authQueue.sync {
             pendingAuthRequests.removeAll()
-            oauthManager.revokeAllRefreshTokens()
+            try oauthManager.revokeAllRefreshTokens()
         }
         statsQueue.async { [weak self] in
             self?.activeSessions.removeAll()
@@ -858,12 +859,12 @@ final class McpServerManager {
         }
     }
 
-    func renameAuthorizedSession(_ token: String, sessionName: String?) {
-        oauthManager.renameRefreshToken(token, sessionName: sessionName)
+    func renameAuthorizedSession(_ id: String, sessionName: String?) throws {
+        try oauthManager.renameSession(id, sessionName: sessionName)
         statsQueue.async { [weak self] in self?.emitStatsUpdate() }
     }
 
-    private func handleToken(_ request: HttpRequest) -> HttpResponse {
+    private func handleToken(_ request: HttpRequest) throws -> HttpResponse {
         guard let params = parseFormBody(request.body) else {
             return jsonResponse(["error": "invalid_request", "error_description": "Invalid body"])
         }
@@ -887,55 +888,28 @@ final class McpServerManager {
             return jsonResponse(["error": "invalid_request", "error_description": "Missing parameters"])
         }
 
-        if grantType == "authorization_code" {
-            guard let result = oauthManager.exchangeCode(
-                code: code,
-                clientId: clientId,
-                redirectUri: redirectUri,
-                codeVerifier: codeVerifier
-            ) else {
-                LogStore.shared.log("OAuth token error: invalid grant for client_id=\(clientId)", level: .warning)
-                return jsonResponse(["error": "invalid_grant", "error_description": "Invalid code"])
-            }
-
-            let response: [String: Any] = [
-                "access_token": result.token,
-                "accessToken": result.token,
-                "refresh_token": result.refreshToken,
-                "token_type": "Bearer",
-                "expires_in": result.expiresIn,
-                "scope": result.scope
-            ]
-            LogStore.shared.log("Issued OAuth token for client=\(clientId) scope=\"\(result.scope)\" keys=\(response.keys.sorted())")
-            statsQueue.async { [weak self] in self?.emitStatsUpdate() }
-            return jsonResponse(response)
-        }
-
-        if grantType == "refresh_token" {
-            if refreshToken.isEmpty {
-                LogStore.shared.log("OAuth token error: missing refresh_token", level: .warning)
+        let tokens: OAuthTokens?
+        switch grantType {
+        case "authorization_code":
+            tokens = try oauthManager.exchangeCode(code: code, clientId: clientId, redirectUri: redirectUri, codeVerifier: codeVerifier)
+        case "refresh_token":
+            guard !refreshToken.isEmpty else {
                 return jsonResponse(["error": "invalid_request", "error_description": "Missing refresh_token"])
             }
-
-            guard let result = oauthManager.exchangeRefreshToken(refreshToken: refreshToken, clientId: clientId) else {
-                LogStore.shared.log("OAuth token error: invalid refresh_token for client_id=\(clientId)", level: .warning)
-                return jsonResponse(["error": "invalid_grant", "error_description": "Invalid refresh_token"])
-            }
-
-            let response: [String: Any] = [
-                "access_token": result.token,
-                "accessToken": result.token,
-                "token_type": "Bearer",
-                "expires_in": result.expiresIn,
-                "scope": result.scope
-            ]
-            LogStore.shared.log("Issued OAuth refresh token for client=\(clientId) scope=\"\(result.scope)\" keys=\(response.keys.sorted())")
-            statsQueue.async { [weak self] in self?.emitStatsUpdate() }
-            return jsonResponse(response)
+            tokens = try oauthManager.exchangeRefreshToken(refreshToken: refreshToken, clientId: clientId)
+        default:
+            return jsonResponse(["error": "unsupported_grant_type", "error_description": "Unsupported grant_type"])
         }
+        guard let tokens else {
+            return jsonResponse(["error": "invalid_grant"], headers: ["Cache-Control": "no-store"], status: 400)
+        }
+        statsQueue.async { [weak self] in self?.emitStatsUpdate() }
+        return jsonResponse([
+            "access_token": tokens.token, "accessToken": tokens.token,
+            "refresh_token": tokens.refreshToken, "token_type": "Bearer",
+            "expires_in": tokens.expiresIn, "scope": tokens.scope
+        ], headers: ["Cache-Control": "no-store"])
 
-        LogStore.shared.log("OAuth token error: unsupported grant_type \(grantType)", level: .warning)
-        return jsonResponse(["error": "unsupported_grant_type", "error_description": "Unsupported grant_type"])
     }
 
     private func handleRegister(_ request: HttpRequest) -> HttpResponse {
@@ -955,7 +929,7 @@ final class McpServerManager {
             prunePendingAuthRequestsLocked(now: now)
             if registeredClients.count >= 256 {
                 // Recycle unused registrations instead of letting unauthenticated callers fill storage forever.
-                let inUse = Set(oauthManager.listRefreshTokens().map(\.clientId))
+                let inUse = Set(oauthManager.listSessions().map(\.clientId))
                     .union(pendingAuthRequests.values.map(\.clientId))
                 guard let oldest = registeredClients.filter({ !inUse.contains($0.key) })
                     .min(by: { $0.value.createdAt < $1.value.createdAt }) else { return false }
@@ -1166,7 +1140,7 @@ final class McpServerManager {
         return jsonResponse(payload)
     }
 
-    private func jsonResponse(_ payload: [String: Any], headers: [String: String] = [:]) -> HttpResponse {
+    private func jsonResponse(_ payload: [String: Any], headers: [String: String] = [:], status: Int = 200) -> HttpResponse {
         guard let data = try? JSONSerialization.data(withJSONObject: payload, options: []) else {
             return .internalServerError
         }
@@ -1176,7 +1150,7 @@ final class McpServerManager {
             responseHeaders[key] = value
         }
 
-        return .raw(200, "OK", responseHeaders, { writer in
+        return .raw(status, HTTPURLResponse.localizedString(forStatusCode: status), responseHeaders, { writer in
             try writer.write(data)
         })
     }

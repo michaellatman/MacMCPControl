@@ -1,55 +1,5 @@
 import Foundation
 import CryptoKit
-import Security
-
-private enum KeychainStore {
-    private static let service = "MacMCPControl"
-
-    static func load(account: String) -> Data? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecReturnData as String: true
-        ]
-        var item: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &item)
-        guard status == errSecSuccess else {
-            return nil
-        }
-        return item as? Data
-    }
-
-    static func save(account: String, data: Data) {
-        let attributes: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
-            kSecValueData as String: data
-        ]
-
-        let updateQuery: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account
-        ]
-
-        let status = SecItemUpdate(updateQuery as CFDictionary, [kSecValueData as String: data] as CFDictionary)
-        if status == errSecItemNotFound {
-            _ = SecItemAdd(attributes as CFDictionary, nil)
-        }
-    }
-
-    static func delete(account: String) {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account
-        ]
-        _ = SecItemDelete(query as CFDictionary)
-    }
-}
 
 struct OAuthCodeRecord {
     let clientId: String
@@ -62,67 +12,61 @@ struct OAuthCodeRecord {
 }
 
 struct OAuthTokenRecord {
-    var grantId: String? = nil
+    let grantId: String
     let clientId: String
     let scope: String
     let expiresAt: Date
-    var sessionName: String?
-    var lastUsedAt: Date?
 }
 
-struct OAuthRefreshTokenInfo {
-    let token: String
-    let clientId: String
-    let scope: String
-    let expiresAt: Date
-    let sessionName: String?
-    let lastUsedAt: Date?
-}
+typealias OAuthTokens = (token: String, refreshToken: String, expiresIn: Int, scope: String)
 
 final class OAuthManager {
     private var codes: [String: OAuthCodeRecord] = [:]
-    private var refreshTokens: [String: OAuthTokenRecord] = [:]
-    private var revokedClientIds: Set<String> = []
-    private var lastUsedSaveFloorByClientId: [String: Date] = [:]
-    private var signingKey: SymmetricKey
     private let tokenQueue = DispatchQueue(label: "mac.mcp.oauth.tokens")
-
     private let codeTtl: TimeInterval = 5 * 60
     private let tokenTtl: TimeInterval = 60 * 60
     private let refreshTokenTtl: TimeInterval = 30 * 24 * 60 * 60
+    private let load: () throws -> OAuthState
+    private let save: (OAuthState) throws -> Void
+    private var state: OAuthState?
+    private var unsavedRevocation = false
 
-    private let saveTokens: ([String: OAuthTokenRecord]) -> Void
-    private let saveRevokedClients: (Set<String>) -> Void
-    private let rotateKey: () -> SymmetricKey
-
-    init(
-        signingKey: SymmetricKey = OAuthKeyStore.loadOrCreateKey(),
-        refreshTokens: [String: OAuthTokenRecord] = OAuthTokenStore.load(),
-        revokedClientIds: Set<String> = RevokedClientStore.load(),
-        saveTokens: @escaping ([String: OAuthTokenRecord]) -> Void = OAuthTokenStore.save,
-        saveRevokedClients: @escaping (Set<String>) -> Void = RevokedClientStore.save,
-        rotateKey: @escaping () -> SymmetricKey = OAuthKeyStore.regenerateKey
-    ) {
-        self.signingKey = signingKey
-        self.refreshTokens = refreshTokens.filter { $0.value.grantId != nil }
-        self.revokedClientIds = revokedClientIds
-        self.saveTokens = saveTokens
-        self.saveRevokedClients = saveRevokedClients
-        self.rotateKey = rotateKey
+    init(load: @escaping () throws -> OAuthState = OAuthStateStore.load,
+         save: @escaping (OAuthState) throws -> Void = OAuthStateStore.save) {
+        self.load = load
+        self.save = save
     }
 
-    // Must be called while holding tokenQueue (i.e. from tokenQueue.sync).
-    @discardableResult
-    private func pruneRefreshTokensLocked(now: Date = Date()) -> Bool {
-        let beforeCount = refreshTokens.count
-        refreshTokens = refreshTokens.filter { token, record in
-            record.expiresAt >= now && !revokedClientIds.contains(record.clientId)
+    func prepare() throws {
+        try tokenQueue.sync { _ = try currentState() }
+    }
+
+    // All state access is serialized by tokenQueue.
+    private func currentState() throws -> OAuthState {
+        if let state {
+            if unsavedRevocation {
+                try save(state)
+                unsavedRevocation = false
+            }
+            return state
         }
-        if refreshTokens.count != beforeCount {
-            saveTokens(refreshTokens)
-            return true
-        }
-        return false
+        let loaded = try load()
+        state = loaded
+        return loaded
+    }
+
+    private func commit(_ next: OAuthState) throws {
+        try save(next)
+        state = next
+    }
+
+    // Deny access immediately even if the Keychain is locked. Retry the write
+    // before issuing credentials or reporting a subsequent revocation as complete.
+    private func commitRevocation(_ next: OAuthState) throws {
+        state = next
+        unsavedRevocation = true
+        try save(next)
+        unsavedRevocation = false
     }
 
     func issueAuthorizationCode(
@@ -152,240 +96,139 @@ final class OAuthManager {
         }
     }
 
-    func exchangeCode(
-        code: String,
-        clientId: String,
-        redirectUri: String,
-        codeVerifier: String?
-    ) -> (token: String, refreshToken: String, expiresIn: Int, scope: String)? {
-        return tokenQueue.sync {
-            guard let record = codes[code] else {
-                return nil
-            }
-
-            codes.removeValue(forKey: code)
-
-            if record.clientId != clientId || record.redirectUri != redirectUri || record.expiresAt < Date() {
-                return nil
-            }
-
-            guard let challenge = record.codeChallenge, let verifier = codeVerifier,
+    func exchangeCode(code: String, clientId: String, redirectUri: String,
+                      codeVerifier: String?) throws -> OAuthTokens? {
+        try tokenQueue.sync {
+            guard let record = codes[code], record.clientId == clientId,
+                  record.redirectUri == redirectUri, record.expiresAt >= Date(),
+                  let challenge = record.codeChallenge, let verifier = codeVerifier,
                   OAuthPolicy.validVerifier(verifier), record.codeChallengeMethod == "S256",
                   sha256Base64Url(verifier) == challenge else { return nil }
-
-            // Remove from revoked list since they're reauthorizing
-            if revokedClientIds.contains(clientId) {
-                revokedClientIds.remove(clientId)
-                saveRevokedClients(revokedClientIds)
-            }
-
-            let grantId = UUID().uuidString
-            let token = issueAccessToken(clientId: clientId, scope: record.scope, grantId: grantId)
-            let refreshToken = issueRefreshToken(clientId: clientId, scope: record.scope, sessionName: record.sessionName, grantId: grantId)
-            return (token, refreshToken, Int(tokenTtl), record.scope)
+            let state = try currentState()
+            let grant = OAuthGrant(id: UUID().uuidString, clientId: clientId, scope: record.scope,
+                                   expiresAt: Date().addingTimeInterval(refreshTokenTtl),
+                                   sessionName: record.sessionName, lastUsedAt: nil, refreshDigest: Data())
+            let tokens = try issueTokens(for: grant, in: state)
+            codes.removeValue(forKey: code)
+            return tokens
         }
     }
 
-    func exchangeRefreshToken(
-        refreshToken: String,
-        clientId: String
-    ) -> (token: String, expiresIn: Int, scope: String)? {
-        return tokenQueue.sync {
-            // Keep storage consistent and ensure revoked clients can't mint new access tokens.
-            _ = pruneRefreshTokensLocked()
-
-            guard let record = decodeToken(refreshToken, expectedKind: "refresh", key: signingKey) else {
+    func exchangeRefreshToken(refreshToken: String, clientId: String) throws -> OAuthTokens? {
+        try tokenQueue.sync {
+            var state = try currentState()
+            let key = SymmetricKey(data: state.signingKey)
+            guard let record = decodeToken(refreshToken, expectedKind: "refresh", key: key),
+                  record.clientId == clientId, record.expiresAt >= Date(),
+                  var grant = state.grants[record.grantId],
+                  grant.clientId == clientId, grant.scope == record.scope,
+                  grant.expiresAt >= Date() else { return nil }
+            guard grant.refreshDigest == OAuthGrant.digest(refreshToken) else {
+                state.grants.removeValue(forKey: record.grantId)
+                try commitRevocation(state)
                 return nil
             }
-
-            if revokedClientIds.contains(record.clientId) || revokedClientIds.contains(clientId) {
-                return nil
-            }
-
-            // This is a concrete "use" of the session.
-            touchClientLocked(record.clientId, now: Date())
-
-            guard let stored = refreshTokens[refreshToken] else {
-                return nil
-            }
-
-            if stored.clientId != clientId || stored.scope != record.scope || stored.grantId != record.grantId {
-                return nil
-            }
-
-            if record.expiresAt < Date() {
-                refreshTokens.removeValue(forKey: refreshToken)
-                saveTokens(refreshTokens)
-                return nil
-            }
-
-            guard let grantId = stored.grantId else { return nil }
-            let token = issueAccessToken(clientId: record.clientId, scope: record.scope, grantId: grantId)
-            return (token, Int(tokenTtl), record.scope)
+            grant.lastUsedAt = Date()
+            return try issueTokens(for: grant, in: state)
         }
+    }
+
+    private func issueTokens(for grant: OAuthGrant, in state: OAuthState) throws -> OAuthTokens {
+        let key = SymmetricKey(data: state.signingKey)
+        let refresh = try signToken(kind: "refresh", clientId: grant.clientId, scope: grant.scope,
+                                    expiresAt: grant.expiresAt, key: key, grantId: grant.id)
+        let access = try signToken(kind: "access", clientId: grant.clientId, scope: grant.scope,
+                                   expiresAt: Date().addingTimeInterval(tokenTtl), key: key, grantId: grant.id)
+        var next = state
+        next.grants = next.grants.filter { $0.value.expiresAt >= Date() }
+        var updated = grant
+        updated.refreshDigest = OAuthGrant.digest(refresh)
+        next.grants[grant.id] = updated
+        try commit(next)
+        return (access, refresh, Int(tokenTtl), grant.scope)
+    }
+
+    private func accessRecord(_ token: String) -> OAuthTokenRecord? {
+        guard let state, let record = decodeToken(token, expectedKind: "access", key: SymmetricKey(data: state.signingKey)),
+              record.expiresAt >= Date(), let grant = state.grants[record.grantId],
+              grant.clientId == record.clientId, record.scope == "mcp:tools",
+              grant.scope == record.scope, grant.expiresAt >= Date() else { return nil }
+        return record
     }
 
     func introspect(token: String) -> OAuthTokenRecord? {
-        return tokenQueue.sync {
-            guard let record = decodeToken(token, expectedKind: "access", key: signingKey) else {
-                return nil
-            }
-            if record.expiresAt < Date() {
-                return nil
-            }
-            if revokedClientIds.contains(record.clientId) || !hasLiveGrant(record) {
-                return nil
-            }
-            return record
-        }
+        tokenQueue.sync { accessRecord(token) }
     }
 
     func validateBearer(_ token: String) -> Bool {
-        return tokenQueue.sync {
-            guard let record = decodeToken(token, expectedKind: "access", key: signingKey) else {
-                return false
+        tokenQueue.sync {
+            guard let record = accessRecord(token),
+                  var state, var grant = state.grants[record.grantId] else { return false }
+            let now = Date()
+            if now.timeIntervalSince(grant.lastUsedAt ?? .distantPast) >= 30 {
+                grant.lastUsedAt = now
+                state.grants[grant.id] = grant
+                do {
+                    try commit(state)
+                    unsavedRevocation = false
+                } catch {
+                    LogStore.shared.log("Could not save OAuth activity: \(error.localizedDescription)", level: .error)
+                }
             }
-            if record.expiresAt < Date() {
-                return false
-            }
-            guard !revokedClientIds.contains(record.clientId), hasLiveGrant(record) else {
-                return false
-            }
-            touchClientLocked(record.clientId, now: Date())
             return true
         }
     }
 
     func authorizedSessionCount() -> Int {
-        return tokenQueue.sync {
-            _ = pruneRefreshTokensLocked()
-            return refreshTokens.count
-        }
-    }
-
-    func listRefreshTokens() -> [OAuthRefreshTokenInfo] {
-        return tokenQueue.sync {
-            _ = pruneRefreshTokensLocked()
-            let infos = refreshTokens.map { token, record in
-                OAuthRefreshTokenInfo(
-                    token: token,
-                    clientId: record.clientId,
-                    scope: record.scope,
-                    expiresAt: record.expiresAt,
-                    sessionName: record.sessionName,
-                    lastUsedAt: record.lastUsedAt
-                )
-            }
-            return infos.sorted { $0.expiresAt < $1.expiresAt }
-        }
-    }
-
-    func renameRefreshToken(_ token: String, sessionName: String?) {
         tokenQueue.sync {
-            guard var record = refreshTokens[token] else {
-                return
+            if unsavedRevocation {
+                do {
+                    _ = try currentState()
+                } catch {
+                    LogStore.shared.log("OAuth revocation is still unsaved: \(error.localizedDescription)", level: .error)
+                }
             }
-            let trimmed = sessionName?.trimmingCharacters(in: .whitespacesAndNewlines)
-            record.sessionName = (trimmed?.isEmpty == false) ? trimmed : nil
-            refreshTokens[token] = record
-            saveTokens(refreshTokens)
+            return state?.grants.values.filter { $0.expiresAt >= Date() }.count ?? 0
         }
     }
 
-    func revokeRefreshToken(_ token: String) {
+    func listSessions() -> [OAuthGrant] {
         tokenQueue.sync {
-            guard let record = refreshTokens[token] else {
-                refreshTokens.removeValue(forKey: token)
-                saveTokens(refreshTokens)
-                return
-            }
-
-            // Revocation is per-client (used to invalidate existing access tokens), so remove all refresh tokens
-            // for that client and prevent refresh-token exchanges until they reauthorize.
-            codes = codes.filter { $0.value.clientId != record.clientId }
-            revokedClientIds.insert(record.clientId)
-            saveRevokedClients(revokedClientIds)
-            lastUsedSaveFloorByClientId.removeValue(forKey: record.clientId)
-            refreshTokens = refreshTokens.filter { _, value in
-                value.clientId != record.clientId
-            }
-            saveTokens(refreshTokens)
+            guard let state else { return [] }
+            return state.grants.values.filter { $0.expiresAt >= Date() }.sorted { $0.expiresAt < $1.expiresAt }
         }
     }
 
-    func revokeAllRefreshTokens() {
-        tokenQueue.sync {
-            // Regenerate signing key to invalidate ALL existing tokens immediately
-            signingKey = rotateKey()
+    func renameSession(_ id: String, sessionName: String?) throws {
+        try tokenQueue.sync {
+            var state = try currentState()
+            guard var grant = state.grants[id] else { return }
+            grant.sessionName = sessionName?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if grant.sessionName?.isEmpty == true { grant.sessionName = nil }
+            state.grants[id] = grant
+            try commit(state)
+        }
+    }
+
+    func revokeSession(_ id: String) throws {
+        try tokenQueue.sync {
+            var state = try currentState()
+            guard let client = state.grants[id]?.clientId else { return }
+            codes = codes.filter { $0.value.clientId != client }
+            state.grants = state.grants.filter { $0.value.clientId != client }
+            try commitRevocation(state)
+        }
+    }
+
+    func revokeAllRefreshTokens() throws {
+        try tokenQueue.sync {
+            _ = try currentState()
             codes.removeAll()
-            refreshTokens.removeAll()
-            revokedClientIds.removeAll()
-            lastUsedSaveFloorByClientId.removeAll()
-            saveTokens(refreshTokens)
-            saveRevokedClients(revokedClientIds)
+            try commitRevocation(OAuthState(signingKey: OAuthState.freshKey(), grants: [:]))
         }
     }
 
-    // Must be called while holding tokenQueue.
-    private func touchClientLocked(_ clientId: String, now: Date) {
-        // Update all stored refresh tokens for this client (Sessions UI reads from refreshTokens).
-        let tokensForClient = refreshTokens
-            .filter { _, record in record.clientId == clientId }
-            .map(\.key)
-
-        guard !tokensForClient.isEmpty else {
-            return
-        }
-
-        for token in tokensForClient {
-            guard var record = refreshTokens[token] else { continue }
-            record.lastUsedAt = now
-            refreshTokens[token] = record
-        }
-
-        // Avoid writing to disk on every tool call.
-        if let floor = lastUsedSaveFloorByClientId[clientId], now.timeIntervalSince(floor) < 30 {
-            return
-        }
-        lastUsedSaveFloorByClientId[clientId] = now
-        saveTokens(refreshTokens)
-    }
-
-    private func issueAccessToken(clientId: String, scope: String, grantId: String) -> String {
-        let expiresAt = Date().addingTimeInterval(tokenTtl)
-        return signToken(
-            kind: "access",
-            clientId: clientId,
-            scope: scope,
-            expiresAt: expiresAt,
-            key: signingKey,
-            grantId: grantId
-        )
-    }
-
-    private func issueRefreshToken(clientId: String, scope: String, sessionName: String?, grantId: String) -> String {
-        let expiresAt = Date().addingTimeInterval(refreshTokenTtl)
-        let token = signToken(
-            kind: "refresh",
-            clientId: clientId,
-            scope: scope,
-            expiresAt: expiresAt,
-            key: signingKey,
-            grantId: grantId
-        )
-        refreshTokens[token] = OAuthTokenRecord(
-            grantId: grantId,
-            clientId: clientId,
-            scope: scope,
-            expiresAt: expiresAt,
-            sessionName: sessionName,
-            lastUsedAt: nil
-        )
-        saveTokens(refreshTokens)
-        return token
-    }
-
-    private func signToken(kind: String, clientId: String, scope: String, expiresAt: Date, key: SymmetricKey, grantId: String) -> String {
+    private func signToken(kind: String, clientId: String, scope: String, expiresAt: Date, key: SymmetricKey, grantId: String) throws -> String {
         let header: [String: Any] = ["alg": "HS256", "typ": "JWT"]
         let issuedAt = Date()
         let payload: [String: Any] = [
@@ -398,12 +241,8 @@ final class OAuthManager {
             "exp": Int(expiresAt.timeIntervalSince1970)
         ]
 
-        guard
-            let headerData = try? JSONSerialization.data(withJSONObject: header, options: []),
-            let payloadData = try? JSONSerialization.data(withJSONObject: payload, options: [])
-        else {
-            return ""
-        }
+        let headerData = try JSONSerialization.data(withJSONObject: header)
+        let payloadData = try JSONSerialization.data(withJSONObject: payload)
 
         let headerPart = base64UrlEncode(headerData)
         let payloadPart = base64UrlEncode(payloadData)
@@ -472,13 +311,6 @@ final class OAuthManager {
         return Data(base64Encoded: base64)
     }
 
-    private func hasLiveGrant(_ record: OAuthTokenRecord) -> Bool {
-        guard let grantId = record.grantId, record.scope == "mcp:tools" else { return false }
-        return refreshTokens.values.contains {
-            $0.grantId == grantId && $0.clientId == record.clientId && $0.expiresAt >= Date()
-        }
-    }
-
     private func sha256Base64Url(_ input: String) -> String {
         let data = Data(input.utf8)
         let digest = SHA256.hash(data: data)
@@ -487,151 +319,5 @@ final class OAuthManager {
             .replacingOccurrences(of: "+", with: "-")
             .replacingOccurrences(of: "/", with: "_")
             .replacingOccurrences(of: "=", with: "")
-    }
-}
-
-enum OAuthTokenStore {
-    private struct PersistedToken: Codable {
-        let token: String
-        let grantId: String?
-        let clientId: String
-        let scope: String
-        let expiresAt: TimeInterval
-        let sessionName: String?
-        let lastUsedAt: TimeInterval?
-    }
-
-    static func load() -> [String: OAuthTokenRecord] {
-        if let data = KeychainStore.load(account: "refresh_tokens"),
-           let decoded = try? JSONDecoder().decode([PersistedToken].self, from: data) {
-            return decodeTokens(decoded)
-        }
-
-        guard let data = try? Data(contentsOf: storeUrl()),
-              let decoded = try? JSONDecoder().decode([PersistedToken].self, from: data) else {
-            return [:]
-        }
-
-        LogStore.shared.log("Migrated refresh tokens from disk to Keychain.")
-        KeychainStore.save(account: "refresh_tokens", data: data)
-        try? FileManager.default.removeItem(at: storeUrl())
-        return decodeTokens(decoded)
-    }
-
-    static func save(_ tokens: [String: OAuthTokenRecord]) {
-        let payload = tokens.map { token, record in
-            PersistedToken(
-                token: token,
-                grantId: record.grantId,
-                clientId: record.clientId,
-                scope: record.scope,
-                expiresAt: record.expiresAt.timeIntervalSince1970,
-                sessionName: record.sessionName,
-                lastUsedAt: record.lastUsedAt?.timeIntervalSince1970
-            )
-        }
-        guard let data = try? JSONEncoder().encode(payload) else {
-            return
-        }
-        KeychainStore.save(account: "refresh_tokens", data: data)
-    }
-
-    private static func storeUrl() -> URL {
-        let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        return root
-            .appendingPathComponent("MacMCPControl", isDirectory: true)
-            .appendingPathComponent("refresh_tokens.json")
-    }
-
-    private static func decodeTokens(_ decoded: [PersistedToken]) -> [String: OAuthTokenRecord] {
-        var tokens: [String: OAuthTokenRecord] = [:]
-        for entry in decoded {
-            tokens[entry.token] = OAuthTokenRecord(
-                grantId: entry.grantId,
-                clientId: entry.clientId,
-                scope: entry.scope,
-                expiresAt: Date(timeIntervalSince1970: entry.expiresAt),
-                sessionName: entry.sessionName,
-                lastUsedAt: entry.lastUsedAt.map { Date(timeIntervalSince1970: $0) }
-            )
-        }
-        return tokens
-    }
-}
-
-enum OAuthKeyStore {
-    static func loadOrCreateKey() -> SymmetricKey {
-        if let data = KeychainStore.load(account: "oauth_signing_key") {
-            return SymmetricKey(data: data)
-        }
-
-        let url = keyUrl()
-        if let data = try? Data(contentsOf: url),
-           let keyData = Data(base64Encoded: data) {
-            LogStore.shared.log("Migrated OAuth signing key from disk to Keychain.")
-            KeychainStore.save(account: "oauth_signing_key", data: keyData)
-            try? FileManager.default.removeItem(at: url)
-            return SymmetricKey(data: keyData)
-        }
-
-        return generateAndSaveKey()
-    }
-
-    static func regenerateKey() -> SymmetricKey {
-        return generateAndSaveKey()
-    }
-
-    private static func generateAndSaveKey() -> SymmetricKey {
-        var bytes = [UInt8](repeating: 0, count: 32)
-        let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
-        if status != errSecSuccess {
-            let fallback = SymmetricKey(size: .bits256)
-            return fallback
-        }
-
-        let keyData = Data(bytes)
-        KeychainStore.save(account: "oauth_signing_key", data: keyData)
-        return SymmetricKey(data: keyData)
-    }
-
-    private static func keyUrl() -> URL {
-        let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        return root
-            .appendingPathComponent("MacMCPControl", isDirectory: true)
-            .appendingPathComponent("oauth_signing_key")
-    }
-}
-
-enum RevokedClientStore {
-    static func load() -> Set<String> {
-        if let data = KeychainStore.load(account: "revoked_clients"),
-           let decoded = try? JSONDecoder().decode([String].self, from: data) {
-            return Set(decoded)
-        }
-
-        guard let data = try? Data(contentsOf: storeUrl()),
-              let decoded = try? JSONDecoder().decode([String].self, from: data) else {
-            return []
-        }
-
-        LogStore.shared.log("Migrated revoked clients from disk to Keychain.")
-        KeychainStore.save(account: "revoked_clients", data: data)
-        try? FileManager.default.removeItem(at: storeUrl())
-        return Set(decoded)
-    }
-
-    static func save(_ clientIds: Set<String>) {
-        let payload = Array(clientIds)
-        guard let data = try? JSONEncoder().encode(payload) else {
-            return
-        }
-        KeychainStore.save(account: "revoked_clients", data: data)
-    }
-
-    private static func storeUrl() -> URL {
-        let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        return root
-            .appendingPathComponent("MacMCPControl", isDirectory: true)
-            .appendingPathComponent("revoked_clients.json")
     }
 }

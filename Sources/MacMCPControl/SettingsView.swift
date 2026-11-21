@@ -609,22 +609,12 @@ struct LogsTabView: View {
 struct SessionsTabView: View {
     let mcpServerManager: McpServerManager
 
-    @State private var sessions: [SessionInfo] = []
+    @State private var sessions: [OAuthGrant] = []
     @State private var selectedSessions: Set<String> = []
     @State private var refreshTask: Task<Void, Never>?
     @State private var isShowingRenameSheet = false
-    @State private var renameToken: String?
+    @State private var renameGrantID: String?
     @State private var renameText: String = ""
-
-    struct SessionInfo: Identifiable {
-        let id: String
-        let token: String
-        let clientId: String
-        let scope: String
-        let expiresAt: Date
-        let sessionName: String?
-        let lastUsedAt: Date?
-    }
 
     var body: some View {
         VStack(spacing: 16) {
@@ -670,10 +660,11 @@ struct SessionsTabView: View {
             RenameSessionSheet(
                 name: $renameText,
                 onSave: {
-                    guard let token = renameToken else { return }
-                    mcpServerManager.renameAuthorizedSession(token, sessionName: renameText)
-                    isShowingRenameSheet = false
-                    refreshSessions()
+                    guard let id = renameGrantID else { return }
+                    changeSessions {
+                        try mcpServerManager.renameAuthorizedSession(id, sessionName: renameText)
+                        isShowingRenameSheet = false
+                    }
                 }
             )
         }
@@ -710,17 +701,7 @@ struct SessionsTabView: View {
     }
 
     private func refreshSessions() {
-        sessions = mcpServerManager.listAuthorizedSessions().map { session in
-            SessionInfo(
-                id: session.token,
-                token: session.token,
-                clientId: session.clientId,
-                scope: session.scope,
-                expiresAt: session.expiresAt,
-                sessionName: session.sessionName,
-                lastUsedAt: session.lastUsedAt
-            )
-        }
+        sessions = mcpServerManager.listAuthorizedSessions()
     }
 
     private func startLiveRefresh() {
@@ -736,29 +717,43 @@ struct SessionsTabView: View {
     }
 
     private func renameSelected() {
-        guard selectedSessions.count == 1, let token = selectedSessions.first else {
+        guard selectedSessions.count == 1, let id = selectedSessions.first else {
             return
         }
-        guard let session = sessions.first(where: { $0.token == token }) else {
+        guard let session = sessions.first(where: { $0.id == id }) else {
             return
         }
-        renameToken = token
+        renameGrantID = id
         renameText = session.sessionName ?? ""
         isShowingRenameSheet = true
     }
 
     private func revokeSelected() {
-        for sessionId in selectedSessions {
-            mcpServerManager.revokeAuthorizedSession(sessionId)
+        changeSessions {
+            for id in selectedSessions { try mcpServerManager.revokeAuthorizedSession(id) }
+            selectedSessions.removeAll()
         }
-        selectedSessions.removeAll()
-        refreshSessions()
     }
 
     private func revokeAll() {
-        mcpServerManager.revokeAllAuthorizedSessions()
-        selectedSessions.removeAll()
-        refreshSessions()
+        changeSessions {
+            try mcpServerManager.revokeAllAuthorizedSessions()
+            selectedSessions.removeAll()
+        }
+    }
+
+    private func changeSessions(_ change: () throws -> Void) {
+        while true {
+            do {
+                try change()
+                refreshSessions()
+                return
+            } catch {
+                LogStore.shared.log("Could not save session changes: \(error.localizedDescription)", level: .error)
+                let alert = sessionStorageAlert(error, title: "Could not save session changes")
+                guard alert.runModal() == .alertFirstButtonReturn else { return }
+            }
+        }
     }
 }
 
@@ -783,7 +778,6 @@ private struct RenameSessionSheet: View {
                 Spacer()
                 Button("Save") {
                     onSave()
-                    dismiss()
                 }
                 .keyboardShortcut(.defaultAction)
             }
@@ -794,7 +788,7 @@ private struct RenameSessionSheet: View {
 }
 
 struct SessionRow: View {
-    let session: SessionsTabView.SessionInfo
+    let session: OAuthGrant
 
     var body: some View {
         HStack(spacing: 16) {

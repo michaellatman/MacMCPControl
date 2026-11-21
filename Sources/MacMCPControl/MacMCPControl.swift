@@ -70,7 +70,13 @@ final class AppState: ObservableObject {
                 self?.enqueueApprovalPrompt(request)
             }
         }
-        mcpServerManager.start()
+        do {
+            try mcpServerManager.start()
+        } catch {
+            status = "Server stopped: \(error.localizedDescription)"
+            LogStore.shared.log(status, level: .error)
+            return
+        }
         mcpUrl = "http://localhost:\(settingsManager.mcpPort)/mcp"
 
         if settingsManager.ngrokEnabled {
@@ -124,6 +130,17 @@ final class AppState: ObservableObject {
     func restartOnboarding() {
         needsSettings = false
         stopServices()
+        while true {
+            do {
+                try mcpServerManager.revokeAllAuthorizedSessions()
+                break
+            } catch {
+                status = "Could not save revocation: \(error.localizedDescription)"
+                LogStore.shared.log(status, level: .error)
+                let alert = sessionStorageAlert(error, title: "Could not reset access")
+                guard alert.runModal() == .alertFirstButtonReturn else { return }
+            }
+        }
         resetToDefaults()
         needsOnboarding = true
     }
@@ -136,9 +153,6 @@ final class AppState: ObservableObject {
         settingsManager.shellEnabled = false
         settingsManager.ngrokEnabled = false
         settingsManager.ngrokAuthToken = ""
-
-        // Revoke all sessions
-        mcpServerManager.revokeAllAuthorizedSessions()
 
         // Reset state
         ngrokUrl = nil
