@@ -63,9 +63,9 @@ Sessions tab shows active authorizations. You can rename, revoke selected, or re
 ## Security Model
 
 - OAuth approvals are in‑app only; the browser cannot grant access.
-- Access tokens expire after one hour; refresh tokens expire after 30 days.
+- Access tokens expire after one hour. Each refresh returns a single-use replacement within the original 30-day approval. Reusing an older refresh token revokes that approval.
 - Revocation blocks new actions; “revoke all” also rotates the signing key and clears pending approvals.
-- OAuth signing key, refresh tokens, and revoked clients are stored in macOS Keychain.
+- The app saves the signing key and active approvals together in macOS Keychain. It stores a digest of each current refresh token.
 - If you enable ngrok, revoke access and stop the tunnel when done. The URL is not an authentication secret.
 
 ## Architecture
@@ -87,12 +87,8 @@ flowchart LR
 ```mermaid
 flowchart TB
   App[Mac MCP Control] -->|Keychain write| Keychain[(Keychain)]
-  Keychain -->|oauth_signing_key| Key[Signing Key]
-  Keychain -->|refresh_tokens| Refresh[Refresh Tokens]
-  Keychain -->|revoked_clients| Revoked[Revoked Clients]
-  MCP[MCP Server] -->|validate bearer| Key
-  MCP -->|refresh exchange| Refresh
-  MCP -->|revocation check| Revoked
+  Keychain --> State[Signing key and active approvals]
+  MCP[MCP Server] -->|validate bearer and rotate refresh token| State
 ```
 
 ## License
@@ -101,7 +97,9 @@ See `LICENSE`.
 
 ## Security changes and client migration
 
-After this update, reconnect existing clients. Tokens from older releases do not contain an approval identifier and are rejected.
+Existing approvals with a grant ID migrate automatically. Older clients without a grant ID must reconnect. Clients must serialize refresh requests and save the replacement `refresh_token` from each successful response. If a refresh response is lost, reconnect. Reusing a spent token ends that approval.
+
+A storage failure returns HTTP 503 during token exchange. The app reports failed revocations and blocks the affected access in memory while it retries the Keychain write. Keep the app running and unlock the Keychain if it reports an unsaved revocation.
 
 The server listens only on `127.0.0.1`. Enable ngrok for remote access; direct LAN access is not supported. Incoming host and browser origin headers must match localhost or the active HTTPS tunnel. OAuth metadata uses the known tunnel URL, not caller-supplied forwarded headers.
 

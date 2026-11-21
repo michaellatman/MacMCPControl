@@ -99,7 +99,7 @@ final class McpServerTests: XCTestCase {
         let result = request("GET", "/oauth/authorize", query: authorizeQuery(try register()))
         let location = try XCTUnwrap(result.headers()["Location"])
         let id = try XCTUnwrap(URLComponents(string: location)?.queryItems?.first?.value)
-        manager.revokeAllAuthorizedSessions()
+        try manager.revokeAllAuthorizedSessions()
         manager.resolveAuthRequest(requestId: id, approve: true, sessionName: nil)
         XCTAssertEqual(request("GET", "/oauth/approve", query: ["request_id": id]).statusCode, 404)
         XCTAssertEqual(oauth.authorizedSessionCount(), 0)
@@ -124,8 +124,34 @@ final class McpServerTests: XCTestCase {
         XCTAssertFalse(settings.shellEnabled)
         let shell = request("POST", "/mcp", body: "{\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"computer\",\"arguments\":{\"actions\":[{\"action\":\"shell\",\"command\":\"exit 99\"}]}}}", headers: headers)
         XCTAssertTrue(try body(shell).contains("Shell access is disabled"))
-        manager.revokeAllAuthorizedSessions()
+        try manager.revokeAllAuthorizedSessions()
         XCTAssertEqual(request("POST", "/mcp", body: "{\"id\":1,\"method\":\"initialize\"}", headers: headers).statusCode, 401)
+    }
+
+    func testRefreshEndpointReturnsReplacementAndReportsStoreFailure() throws {
+        var state = OAuthState(signingKey: OAuthState.freshKey(), grants: [:])
+        var failing = false
+        oauth = OAuthManager(load: { state }, save: {
+            if failing { throw OAuthStorageError.keychain(errSecInteractionNotAllowed) }
+            state = $0
+        })
+        manager = McpServerManager(settingsManager: settings, oauthManager: oauth)
+        manager.configureRoutes()
+        let code = try XCTUnwrap(oauth.issueAuthorizationCode(clientId: "test", redirectUri: "https://example.com",
+            scope: "mcp:tools", sessionName: nil, codeChallenge: testChallenge, codeChallengeMethod: "S256"))
+        let issued = try XCTUnwrap(oauth.exchangeCode(code: code, clientId: "test", redirectUri: "https://example.com", codeVerifier: testVerifier))
+        func refresh(_ token: String) -> HttpResponse {
+            request("POST", "/oauth/token", body: "grant_type=refresh_token&client_id=test&refresh_token=\(token)")
+        }
+        failing = true
+        let failed = refresh(issued.refreshToken)
+        XCTAssertEqual(failed.statusCode, 503)
+        XCTAssertEqual(try json(failed)["error"] as? String, "temporarily_unavailable")
+        failing = false
+        let replacement = try XCTUnwrap(json(refresh(issued.refreshToken))["refresh_token"] as? String)
+        XCTAssertNotEqual(replacement, issued.refreshToken)
+        XCTAssertEqual(refresh(issued.refreshToken).statusCode, 400)
+        XCTAssertEqual(refresh(replacement).statusCode, 400)
     }
 
     func testOriginAndMetadataCannotBePoisoned() throws {
@@ -169,7 +195,7 @@ final class McpServerTests: XCTestCase {
         let reservation = try Socket.tcpSocketForListen(0, true, 1, "127.0.0.1")
         settings.mcpPort = Int(try reservation.port())
         reservation.close()
-        manager.start()
+        try manager.start()
         XCTAssertEqual(manager.server.listenAddressIPv4, "127.0.0.1")
         var request = URLRequest(url: URL(string: "http://127.0.0.1:\(settings.mcpPort)/mcp")!)
         request.httpMethod = "POST"
@@ -209,7 +235,7 @@ final class McpServerTests: XCTestCase {
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         let (_, authorizedResponse) = try await URLSession.shared.data(for: request)
         XCTAssertEqual((authorizedResponse as? HTTPURLResponse)?.statusCode, 200)
-        manager.revokeAllAuthorizedSessions()
+        try manager.revokeAllAuthorizedSessions()
         let (_, revokedResponse) = try await URLSession.shared.data(for: request)
         XCTAssertEqual((revokedResponse as? HTTPURLResponse)?.statusCode, 401)
     }
